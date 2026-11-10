@@ -28,19 +28,20 @@ st.sidebar.title("🎮 Server Workspace Controls")
 live_mode = st.sidebar.toggle("🚀 Activate 24/7 Live Portfolio Feed", value=False)
 refresh_speed = st.sidebar.slider("Polling Frequency (Seconds)", 5, 30, 10)
 
-# Initialize single global ledger accounting matrix for UNLIMITED assets
+MASTER_FALLBACK_UNIVERSE = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD", "NFLX", "PLTR"]
+
+# Initialize single global ledger accounting matrix
 if "history_logs" not in st.session_state:
     st.session_state.history_logs = []
     st.session_state.tick_counter = 0
     st.session_state.ledgers = {ai: [] for ai in ["Gemini", "Claude", "ChatGPT", "Grok"]}
     st.session_state.tracked_prices = {}
     
-    # UNRESTRICTED PORTFOLIO LEDGER (The Engine Handles the Books!)
     st.session_state.accounts = {
         ai: {
             "cash": 100.0,
-            "positions": {},  # Dynamically fills with ANY stock ticker the bots choose
-            "avg_costs": {},
+            "positions": {ticker: 0.0 for ticker in MASTER_FALLBACK_UNIVERSE},
+            "avg_costs": {ticker: 0.0 for ticker in MASTER_FALLBACK_UNIVERSE},
             "trades": [],
             "peak_equity": 100.0,
             "max_dd": 0.0
@@ -58,7 +59,7 @@ if st.sidebar.button("🔄 Reset Server Portfolios"):
     st.rerun()
 
 # ------------------------------------------------------------------
-# 📡 THE LIVE API EXECUTION LOOP (INFINITE MARKET UNIVERSES)
+# 📡 THE LIVE API EXECUTION LOOP (DIAGNOSTIC MODE)
 # ------------------------------------------------------------------
 if live_mode:
     if "PASTE_YOUR_KEY" in ALPACA_KEY or "PASTE_YOUR_SECRET" in ALPACA_SECRET:
@@ -69,32 +70,35 @@ if live_mode:
     st.session_state.tick_counter += 1
     timestamp_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-    # 1. Gather dynamic watchlists directly from your new bot uploads
-    gemini_watchlist = getattr(st.session_state.bot_gemini, 'watchlist', [])
-    claude_watchlist = getattr(st.session_state.bot_claude, 'watchlist', [])
-    chatgpt_watchlist = getattr(st.session_state.bot_chatgpt, 'watchlist', [])
-    grok_watchlist = getattr(st.session_state.bot_grok, 'watchlist', [])
+    gemini_wl = getattr(st.session_state.bot_gemini, 'watchlist', [])
+    claude_wl = getattr(st.session_state.bot_claude, 'watchlist', [])
+    chatgpt_wl = getattr(st.session_state.bot_chatgpt, 'watchlist', [])
+    grok_wl = getattr(st.session_state.bot_grok, 'watchlist', [])
     
-    requested_universe = list(set(gemini_watchlist + claude_watchlist + chatgpt_watchlist + grok_watchlist))
-
-    # 2. Optimized Batch Request using the official Alpaca Data network URL
-    if requested_universe:
-        alpaca_symbols = {t: t.replace("-", ".") for t in requested_universe}
-        try:
-            response = requests.get(
-                "https://alpaca.markets",
-                headers=headers,
-                params={"symbols": ",".join(alpaca_symbols.values()), "feed": "iex"},
-                timeout=10,
-            )
-            if response.status_code == 200:
-                trades = response.json().get("trades", {})
-                for ticker, symbol in alpaca_symbols.items():
-                    if symbol in trades:
-                        st.session_state.tracked_prices[ticker] = float(trades[symbol]["p"])
-                        st.session_state[f"last_known_{ticker}"] = st.session_state.tracked_prices[ticker]
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ Connection skipped one tick (Alpaca busy): {e}")
+    requested_universe = list(set(MASTER_FALLBACK_UNIVERSE + gemini_wl + claude_wl + chatgpt_wl + grok_wl))
+    alpaca_symbols = [t.replace("-", ".") for t in requested_universe]
+    
+    try:
+        data_url = "https://alpaca.markets"
+        response = requests.get(
+            data_url, 
+            headers=headers, 
+            params={"symbols": ",".join(alpaca_symbols), "feed": "iex"},
+            timeout=10
+        )
+        
+        # New Diagnostic Check: Read exactly what text string Alpaca returns
+        if response.status_code != 200:
+            st.sidebar.error(f"❌ Server Error {response.status_code}: {response.text}")
+        else:
+            trades = response.json().get("trades", {})
+            for ticker in requested_universe:
+                symbol_alt = ticker.replace("-", ".")
+                if symbol_alt in trades:
+                    st.session_state.tracked_prices[ticker] = float(trades[symbol_alt]["p"])
+                    st.session_state[f"last_known_{ticker}"] = st.session_state.tracked_prices[ticker]
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Network exception: {e}")
 
     for ticker in requested_universe:
         if ticker not in st.session_state.tracked_prices and f"last_known_{ticker}" in st.session_state:
