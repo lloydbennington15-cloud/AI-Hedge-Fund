@@ -89,84 +89,83 @@ if live_mode:
         except Exception:
             pass
 
-    # 3. Route orders and update the central books
-    for ai_name, bot in [("Gemini", st.session_state.bot_gemini), ("Claude", st.session_state.bot_claude), 
-                         ("ChatGPT", st.session_state.bot_chatgpt), ("Grok", st.session_state.bot_grok)]:
-        
-        # Bots process the current pricing maps and broadcast their intended positions
-        signals = bot.market_tick(st.session_state.tracked_prices, timestamp_utc)
-        acc = st.session_state.accounts[ai_name]
-        
-        for ticker, action in signals.items():
-            if ticker not in st.session_state.tracked_prices:
-                continue
-            price = st.session_state.tracked_prices[ticker]
+    # 3. FIXED ROUTER SIGNAL: Run if we received any price points from the pool
+    if len(st.session_state.tracked_prices) > 0:
+        for ai_name, bot in [("Gemini", st.session_state.bot_gemini), ("Claude", st.session_state.bot_claude), 
+                             ("ChatGPT", st.session_state.bot_chatgpt), ("Grok", st.session_state.bot_grok)]:
             
-            # Initialize dynamic keys inside central books if a new stock is traded
-            if ticker not in acc["positions"]: acc["positions"][ticker] = 0.0
-            if ticker not in acc["avg_costs"]: acc["avg_costs"][ticker] = 0.0
-
-            # Execute Long Buy Orders
-            if action == "BUY" and acc["cash"] >= 20.0 and acc["positions"][ticker] <= 0:
-                if acc["positions"][ticker] < 0: # Cover existing short position
-                    short_units = abs(acc["positions"][ticker])
-                    acc["cash"] -= (short_units * price) * (1 + COMMISSION_FEE)
-                    acc["positions"][ticker] = 0.0
+            signals = bot.market_tick(st.session_state.tracked_prices, timestamp_utc)
+            acc = st.session_state.accounts[ai_name]
+            
+            for ticker, action in signals.items():
+                if ticker not in st.session_state.tracked_prices:
+                    continue
+                price = st.session_state.tracked_prices[ticker]
                 
-                alloc = 20.0
-                fee = alloc * COMMISSION_FEE
-                units = (alloc - fee) / price
-                acc["cash"] -= alloc
-                acc["positions"][ticker] += units
-                acc["avg_costs"][ticker] = price
-                st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟩 BUY", "Asset": ticker, "Units": f"{units:.4f}", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
-                acc["trades"].append({"type": "LONG", "pnl": -fee})
-            
-            # Execute Liquidations
-            elif action == "SELL" and acc["positions"][ticker] > 0:
-                units = acc["positions"][ticker]
-                gross = units * price
-                fee = gross * COMMISSION_FEE
-                net_proceeds = gross - fee
-                pnl = net_proceeds - (units * acc["avg_costs"][ticker])
-                acc["cash"] += net_proceeds
-                acc["positions"][ticker] = 0.0
-                acc["avg_costs"][ticker] = 0.0
-                st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟥 SELL", "Asset": ticker, "Units": "All Units", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
-                acc["trades"].append({"type": "LIQ", "pnl": pnl})
+                if ticker not in acc["positions"]: acc["positions"][ticker] = 0.0
+                if ticker not in acc["avg_costs"]: acc["avg_costs"][ticker] = 0.0
 
-            # Execute Short Orders
-            elif action == "SHORT" and acc["cash"] >= 20.0 and acc["positions"][ticker] >= 0:
-                if acc["positions"][ticker] > 0: # Liquidate long position first
-                    long_units = acc["positions"][ticker]
-                    acc["cash"] += (long_units * price) * (1 - COMMISSION_FEE)
-                    acc["positions"][ticker] = 0.0
+                # Execute Long Buy Orders
+                if action == "BUY" and acc["cash"] >= 20.0 and acc["positions"][ticker] <= 0:
+                    if acc["positions"][ticker] < 0:
+                        short_units = abs(acc["positions"][ticker])
+                        acc["cash"] -= (short_units * price) * (1 + COMMISSION_FEE)
+                        acc["positions"][ticker] = 0.0
                     
-                alloc = 20.0
-                fee = alloc * COMMISSION_FEE
-                units = (alloc - fee) / price
-                acc["cash"] += (alloc - fee)
-                acc["positions"][ticker] -= units
-                acc["avg_costs"][ticker] = price
-                st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟨 SHORT", "Asset": ticker, "Units": f"{units:.4f}", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
-                acc["trades"].append({"type": "SHORT", "pnl": -fee})
+                    alloc = 20.0
+                    fee = alloc * COMMISSION_FEE
+                    units = (alloc - fee) / price
+                    acc["cash"] -= alloc
+                    acc["positions"][ticker] += units
+                    acc["avg_costs"][ticker] = price
+                    st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟩 BUY", "Asset": ticker, "Units": f"{units:.4f}", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
+                    acc["trades"].append({"type": "LONG", "pnl": -fee})
+                
+                # Execute Liquidations
+                elif action == "SELL" and acc["positions"][ticker] > 0:
+                    units = acc["positions"][ticker]
+                    gross = units * price
+                    fee = gross * COMMISSION_FEE
+                    net_proceeds = gross - fee
+                    pnl = net_proceeds - (units * acc["avg_costs"][ticker])
+                    acc["cash"] += net_proceeds
+                    acc["positions"][ticker] = 0.0
+                    acc["avg_costs"][ticker] = 0.0
+                    st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟥 SELL", "Asset": ticker, "Units": "All Units", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
+                    acc["trades"].append({"type": "LIQ", "pnl": pnl})
 
-    # Calculate real overall mark-to-market equity values
-    for model in ["Gemini", "Claude", "ChatGPT", "Grok"]:
-        acc = st.session_state.accounts[model]
-        total_val = acc["cash"]
-        for ticker, units in acc["positions"].items():
-            if units != 0:
-                px = st.session_state.tracked_prices.get(ticker, acc["avg_costs"][ticker])
-                total_val += units * px
-        
-        if total_val > acc["peak_equity"]: acc["peak_equity"] = total_val
-        dd = (acc["peak_equity"] - total_val) / acc["peak_equity"] if acc["peak_equity"] > 0 else 0.0
-        if dd > acc["max_dd"]: acc["max_dd"] = dd
-        
-        st.session_state.history_logs.append({
-            'Time': st.session_state.tick_counter, 'AI Model': model, 'Balance ($)': round(float(total_val), 2)
-        })
+                # Execute Short Orders
+                elif action == "SHORT" and acc["cash"] >= 20.0 and acc["positions"][ticker] >= 0:
+                    if acc["positions"][ticker] > 0:
+                        long_units = acc["positions"][ticker]
+                        acc["cash"] += (long_units * price) * (1 - COMMISSION_FEE)
+                        acc["positions"][ticker] = 0.0
+                        
+                    alloc = 20.0
+                    fee = alloc * COMMISSION_FEE
+                    units = (alloc - fee) / price
+                    acc["cash"] += (alloc - fee)
+                    acc["positions"][ticker] -= units
+                    acc["avg_costs"][ticker] = price
+                    st.session_state.ledgers[ai_name].insert(0, {"Time": timestamp_utc, "Action": "🟨 SHORT", "Asset": ticker, "Units": f"{units:.4f}", "Price": f"${price:.2f}", "Fee Paid": f"${fee:.3f}"})
+                    acc["trades"].append({"type": "SHORT", "pnl": -fee})
+
+        # Calculate real overall mark-to-market equity values
+        for model in ["Gemini", "Claude", "ChatGPT", "Grok"]:
+            acc = st.session_state.accounts[model]
+            total_val = acc["cash"]
+            for ticker, units in acc["positions"].items():
+                if units != 0:
+                    px = st.session_state.tracked_prices.get(ticker, acc["avg_costs"][ticker])
+                    total_val += units * px
+            
+            if total_val > acc["peak_equity"]: acc["peak_equity"] = total_val
+            dd = (acc["peak_equity"] - total_val) / acc["peak_equity"] if acc["peak_equity"] > 0 else 0.0
+            if dd > acc["max_dd"]: acc["max_dd"] = dd
+            
+            st.session_state.history_logs.append({
+                'Time': st.session_state.tick_counter, 'AI Model': model, 'Balance ($)': round(float(total_val), 2)
+            })
 st.title("🏛️ AI Unrestricted 24/7 Server Portfolio Terminal")
 st.markdown("### 📊 Active Market Scanning Pool (Updated Real-Time via Server Data Logs)")
 
