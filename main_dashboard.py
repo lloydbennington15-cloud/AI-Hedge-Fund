@@ -69,32 +69,47 @@ if live_mode:
     st.session_state.tick_counter += 1
     timestamp_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-    # 1. Ask the bots what stocks they want to scan or buy from the whole market right now
-    gemini_watchlist = getattr(st.session_state.bot_gemini, 'watchlist', ['NVDA', 'AAPL'])
-    claude_watchlist = getattr(st.session_state.bot_claude, 'watchlist', ['TSLA', 'MSFT'])
-    chatgpt_watchlist = getattr(st.session_state.bot_chatgpt, 'watchlist', ['AMD', 'AMZN'])
-    grok_watchlist = getattr(st.session_state.bot_grok, 'watchlist', ['NFLX', 'META'])
+    # 1. Gather dynamic watchlists directly from your new bot uploads
+    gemini_watchlist = getattr(st.session_state.bot_gemini, 'watchlist', [])
+    claude_watchlist = getattr(st.session_state.bot_claude, 'watchlist', [])
+    chatgpt_watchlist = getattr(st.session_state.bot_chatgpt, 'watchlist', [])
+    grok_watchlist = getattr(st.session_state.bot_grok, 'watchlist', [])
     
-    # Bundle every requested asset from the entire stock market into a clean unique list
     requested_universe = list(set(gemini_watchlist + claude_watchlist + chatgpt_watchlist + grok_watchlist))
 
-    # 2. Batch query Alpaca's high-speed data feed for the requested universe
-    for ticker in requested_universe:
+    # 2. Optimized Batch Request using the official Alpaca Data network URL
+    if requested_universe:
+        alpaca_symbols = {t: t.replace("-", ".") for t in requested_universe}
         try:
-            symbol_formatted = ticker.replace("-", ".")
-            data_url = f"https://alpaca.markets{symbol_formatted}/trades/latest"
-            response = requests.get(data_url, headers=headers, timeout=5)
+            response = requests.get(
+                "https://alpaca.markets",
+                headers=headers,
+                params={"symbols": ",".join(alpaca_symbols.values()), "feed": "iex"},
+                timeout=10,
+            )
             if response.status_code == 200:
-                st.session_state.tracked_prices[ticker] = float(response.json()['trade']['p'])
-        except Exception:
-            pass
+                trades = response.json().get("trades", {})
+                for ticker, symbol in alpaca_symbols.items():
+                    if symbol in trades:
+                        st.session_state.tracked_prices[ticker] = float(trades[symbol]["p"])
+                        st.session_state[f"last_known_{ticker}"] = st.session_state.tracked_prices[ticker]
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Connection skipped one tick (Alpaca busy): {e}")
 
-    # 3. FIXED ROUTER SIGNAL: Run if we received any price points from the pool
+    for ticker in requested_universe:
+        if ticker not in st.session_state.tracked_prices and f"last_known_{ticker}" in st.session_state:
+            st.session_state.tracked_prices[ticker] = st.session_state[f"last_known_{ticker}"]
+
+    # 3. ROUTER SIGNAL PROCESSOR
     if len(st.session_state.tracked_prices) > 0:
         for ai_name, bot in [("Gemini", st.session_state.bot_gemini), ("Claude", st.session_state.bot_claude), 
                              ("ChatGPT", st.session_state.bot_chatgpt), ("Grok", st.session_state.bot_grok)]:
             
-            signals = bot.market_tick(st.session_state.tracked_prices, timestamp_utc)
+            try:
+                signals = bot.market_tick(st.session_state.tracked_prices, timestamp_utc)
+            except Exception:
+                signals = {}
+                
             acc = st.session_state.accounts[ai_name]
             
             for ticker, action in signals.items():
@@ -156,7 +171,7 @@ if live_mode:
             total_val = acc["cash"]
             for ticker, units in acc["positions"].items():
                 if units != 0:
-                    px = st.session_state.tracked_prices.get(ticker, acc["avg_costs"][ticker])
+                    px = st.session_state.tracked_prices.get(ticker, acc["avg_costs"].get(ticker, price))
                     total_val += units * px
             
             if total_val > acc["peak_equity"]: acc["peak_equity"] = total_val
@@ -238,7 +253,7 @@ for tab_name, ai_key in ai_keys.items():
             inv_data = []
             for ticker, units in acc["positions"].items():
                 if units != 0:
-                    avg_buy = acc["avg_costs"][ticker]
+                    avg_buy = acc["avg_costs"].get(ticker, 0.0)
                     current_px = st.session_state.tracked_prices.get(ticker, avg_buy)
                     total_value = units * current_px
                     pnl = (current_px - avg_buy) * units if units > 0 else (avg_buy - current_px) * abs(units)
