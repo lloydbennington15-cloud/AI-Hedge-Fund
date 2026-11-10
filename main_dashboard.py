@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import requests
+import yfinance as yf
 import time
 from datetime import datetime, timezone
 
@@ -59,14 +59,9 @@ if st.sidebar.button("🔄 Reset Server Portfolios"):
     st.rerun()
 
 # ------------------------------------------------------------------
-# 📡 THE LIVE API EXECUTION LOOP (DIAGNOSTIC MODE)
+# 📡 THE LIVE API EXECUTION LOOP (UNBLOCKABLE YAHOO FINANCE DATA FEED)
 # ------------------------------------------------------------------
 if live_mode:
-    if "PASTE_YOUR_KEY" in ALPACA_KEY or "PASTE_YOUR_SECRET" in ALPACA_SECRET:
-        st.warning("⚠️ Please insert your free Alpaca Server Keys to connect!")
-        st.stop()
-        
-    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
     st.session_state.tick_counter += 1
     timestamp_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
@@ -76,29 +71,29 @@ if live_mode:
     grok_wl = getattr(st.session_state.bot_grok, 'watchlist', [])
     
     requested_universe = list(set(MASTER_FALLBACK_UNIVERSE + gemini_wl + claude_wl + chatgpt_wl + grok_wl))
-    alpaca_symbols = [t.replace("-", ".") for t in requested_universe]
     
+    # Download the current live real-time price snapshot safely via yfinance
     try:
-        data_url = "https://alpaca.markets"
-        response = requests.get(
-            data_url, 
-            headers=headers, 
-            params={"symbols": ",".join(alpaca_symbols), "feed": "iex"},
-            timeout=10
-        )
+        # Batch download the latest 1-day interval quote block for all stocks instantly
+        tickers_string = " ".join(requested_universe)
+        data = yf.download(tickers=tickers_string, period="1d", interval="1m", progress=False)
         
-        # New Diagnostic Check: Read exactly what text string Alpaca returns
-        if response.status_code != 200:
-            st.sidebar.error(f"❌ Server Error {response.status_code}: {response.text}")
-        else:
-            trades = response.json().get("trades", {})
+        if not data.empty:
             for ticker in requested_universe:
-                symbol_alt = ticker.replace("-", ".")
-                if symbol_alt in trades:
-                    st.session_state.tracked_prices[ticker] = float(trades[symbol_alt]["p"])
-                    st.session_state[f"last_known_{ticker}"] = st.session_state.tracked_prices[ticker]
+                try:
+                    # Isolate the final closing price row slice
+                    if len(requested_universe) > 1:
+                        price = float(data['Close'][ticker].dropna().iloc[-1])
+                    else:
+                        price = float(data['Close'].dropna().iloc[-1])
+                    
+                    if price > 0:
+                        st.session_state.tracked_prices[ticker] = price
+                        st.session_state[f"last_known_{ticker}"] = price
+                except Exception:
+                    pass
     except Exception as e:
-        st.sidebar.warning(f"⚠️ Network exception: {e}")
+        st.sidebar.warning(f"⚠️ Yahoo Finance Sync skipped one tick: {e}")
 
     for ticker in requested_universe:
         if ticker not in st.session_state.tracked_prices and f"last_known_{ticker}" in st.session_state:
@@ -190,7 +185,7 @@ st.markdown("### 📊 Active Market Scanning Pool (Updated Real-Time via Server 
 
 # Render active market quotes dynamically based on what the AIs are tracking
 if st.session_state.tracked_prices:
-    active_tickers = list(st.session_state.tracked_prices.keys())[:10]  # Cap metric display layout to top 10 for clean UI
+    active_tickers = list(st.session_state.tracked_prices.keys())[:10]  # Cap display layout to top 10 for clean UI
     m_cols = st.columns(len(active_tickers))
     for i, t in enumerate(active_tickers):
         m_cols[i].metric(t, f"${st.session_state.tracked_prices[t]:.2f}")
