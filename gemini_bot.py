@@ -7,13 +7,13 @@ class GeminiBot:
         self.price_history = {}
         self.window_size = 15
         self.num_std = 2.0
-        self.status = "🤖 Gemini Volatility Sniper: Active Scanning Mode."
+        self.status = "🤖 Gemini Volatility Sniper: Dynamic Sizing Active."
 
     def market_tick(self, data):
         """Processes the institutional server data matrix across the complete US stock market pool"""
         orders = []
         
-        # A. DISCOVERY: Automatically harvest the most explosive movers across thousands of stocks
+        # A. DISCOVERY: Harvest explosive movers across the market
         movers_list = []
         movers_data = data.get("movers", {})
         for category in ["day_gainers", "day_losers", "most_actives", "small_cap_gainers"]:
@@ -21,7 +21,6 @@ class GeminiBot:
                 if item.get("tradable") and item.get("symbol"):
                     movers_list.append(item["symbol"])
                     
-        # Update our active watchlist on the server (Capped safely under the 30-stock engine limit)
         if movers_list:
             unique_movers = list(set(movers_list))[:25]
             self.watchlist = unique_movers
@@ -33,24 +32,30 @@ class GeminiBot:
                 self.price_history[ticker] = []
             self.price_history[ticker].append(float(price))
             
-            # Maintain a rolling technical memory footprint per stock
             if len(self.price_history[ticker]) > 50:
                 self.price_history[ticker].pop(0)
 
-        # Never issue trades if the market is closed or session links are dark
         if not data.get("market", {}).get("is_open"):
             return []
 
-        # C. MATHEMATICAL EXECUTION LOGIC
+        # C. MATHEMATICAL EXECUTION & DYNAMIC EXPOSURE SIZING
         account = data.get("account", {})
         current_positions = account.get("positions", {})
-        available_cash = float(account.get("cash", 0.0))
+        equity = float(account.get("equity", 100.0))
+        max_buy = float(account.get("max_new_buy", 0.0))
+        max_short = float(account.get("max_new_short", 0.0))
+
+        # Target 19.5% of equity per slot (leaves clean buffer for 0.1% fees across 5 positions)
+        target_alloc = round(equity * 0.195, 2)
 
         for ticker in self.watchlist:
             if ticker not in self.price_history or len(self.price_history[ticker]) < self.window_size:
                 continue
                 
-            current_price = current_prices[ticker]
+            if ticker not in current_prices:
+                continue
+
+            current_price = float(current_prices[ticker])
             window = self.price_history[ticker][-self.window_size:]
             mean = np.mean(window)
             std = np.std(window)
@@ -61,21 +66,26 @@ class GeminiBot:
             is_held = ticker in current_positions
             position_side = current_positions[ticker]["side"] if is_held else None
 
-            # Breakout Signals Routing Capped to 20-Order Engine Threshold Limits
             if len(orders) >= 20:
                 break
 
-            # 1. Breakout Long Entry
-            if current_price > upper_band and not is_held and available_cash >= 20.0:
-                orders.append({"symbol": ticker, "action": "BUY", "amount": 20.00})
-                available_cash -= 20.00
+            # 1. Breakout Long Entry (Checks exact engine buying room)
+            if current_price > upper_band and not is_held and max_buy >= 2.0 and current_price >= 1.0:
+                trade_amt = round(min(target_alloc, max_buy * 0.99), 2)
+                if trade_amt >= 2.0:
+                    orders.append({"symbol": ticker, "action": "BUY", "amount": trade_amt})
+                    max_buy -= trade_amt * 1.002
+                    max_short -= trade_amt
                 
-            # 2. Breakout Short Entry (Enforces the engine's strict $5 minimum short rule)
-            elif current_price < lower_band and not is_held and available_cash >= 20.0 and current_price >= 5.0:
-                orders.append({"symbol": ticker, "action": "SHORT", "amount": 20.00})
-                available_cash -= 20.00
+            # 2. Breakout Short Entry (Checks exact engine shorting room & $5 price rule)
+            elif current_price < lower_band and not is_held and max_short >= 2.0 and current_price >= 5.0:
+                trade_amt = round(min(target_alloc, max_short * 0.99), 2)
+                if trade_amt >= 2.0:
+                    orders.append({"symbol": ticker, "action": "SHORT", "amount": trade_amt})
+                    max_short -= trade_amt
+                    max_buy -= trade_amt
                 
-            # 3. Exit Triggers (Trailing breakdown trailing stop floors)
+            # 3. Exit Triggers
             elif is_held:
                 if position_side == "LONG" and current_price < lower_band:
                     orders.append({"symbol": ticker, "action": "SELL", "amount": "ALL"})
