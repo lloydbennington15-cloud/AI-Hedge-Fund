@@ -1,436 +1,514 @@
+"""
+ClaudeBot - Market-Scanning Trend Portfolio
+===========================================
+
+Idea in one paragraph: with a 0.1% fee on every order, trading often is a
+reliable way to lose. So this bot trades rarely. Every night it scans the
+whole US market using six months of daily prices, ranks every liquid stock by
+how strong and how steady its trend is, and once a day it holds a small,
+diversified basket of the best ones. How much it invests - and whether it
+shorts the weakest stocks - depends on the health of the whole market.
+Every position has a trailing stop, so a trend that breaks is cut quickly.
+
+1. SCAN (mostly overnight). The watchlist is rotated through the market, up to
+   30 stocks at a time: first a list of well-known liquid stocks, then today's
+   market movers, then everything else in the universe. For each stock, from
+   daily candles up to yesterday's close:
+     * liquidity  - median daily dollar volume over 20 days (>= $25m)
+     * trend      - price vs its 50-day and 100-day averages
+     * momentum   - ~6-month and ~3-month returns, skipping the latest week
+                    (the last week tends to reverse), divided by volatility,
+                    so steady climbers rank above wild ones
+     * ATR        - the stock's typical daily move, used for its stop
+2. MARKET MOOD, from the liquid stocks scanned:
+     BULL     - at least half are above their 50-day average and the typical
+                large stock is up over 20 days  -> 8 longs, 95% invested
+     NEUTRAL  - in between                      -> 5 longs, 60% invested
+     BEAR     - under 35% above their 50-day average and falling
+                                                -> 2 longs (20%) + 4 shorts (40%)
+3. REBALANCE once per trading day (from 10:00am New York, after the opening
+   rush). Current holdings are kept while they stay in the top 20, so the
+   bot only swaps when something has clearly weakened. Small weight drifts
+   are left alone - fees cost more than they'd fix.
+4. PROTECT, checked every cycle:
+     * longs: sold if they fall 3 x ATR below their best price since bought
+     * shorts: covered if they rise 2.5 x ATR above their low, or 12% above
+       the entry price
+     * a stock that hits a stop can't be re-bought for 3 days
+     * if the account falls 8% below its best level, the next rebalance is
+       capped at NEUTRAL until it recovers
+
+Everything the bot learns is saved in its storage_dir, so a restart loses
+nothing.
+"""
+
+import hashlib
+import json
 import math
+import os
 import time
-from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date
+from statistics import median
+
+
+SEEDS = [
+    # Mega and large caps across sectors, plus liquid popular mid caps.
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "TSLA", "ORCL", "CRM",
+    "ADBE", "AMD", "INTC", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC", "MRVL",
+    "ARM", "SMCI", "DELL", "IBM", "CSCO", "ANET", "NOW", "SNOW", "PLTR", "PANW",
+    "CRWD", "ZS", "NET", "DDOG", "MDB", "SHOP", "UBER", "ABNB", "DASH", "COIN",
+    "HOOD", "XYZ", "PYPL", "INTU", "ADSK", "WDAY", "TEAM", "TTD", "APP", "RBLX",
+    "SNAP", "PINS", "SPOT", "NFLX", "ROKU", "RIVN", "ON", "MPWR", "NXPI", "ADI",
+    "MCHP", "TSM", "ASML", "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW",
+    "BLK", "AXP", "V", "MA", "COF", "SOFI", "LLY", "UNH", "JNJ", "PFE",
+    "MRK", "ABBV", "AMGN", "GILD", "VRTX", "REGN", "ISRG", "MRNA", "BMY", "CVS",
+    "HCA", "DXCM", "WMT", "COST", "HD", "LOW", "TGT", "NKE", "SBUX", "MCD",
+    "CMG", "LULU", "KO", "PEP", "PG", "DIS", "XOM", "CVX", "COP", "OXY",
+    "SLB", "HAL", "DVN", "EOG", "MPC", "CAT", "DE", "BA", "GE", "HON",
+    "LMT", "RTX", "UPS", "FDX", "UNP", "GEV", "VRT", "ETN", "PH", "CCJ",
+    "FSLR", "ENPH", "MSTR", "MARA", "RIOT", "CVNA", "AFRM", "UPST", "DKNG", "ONON",
+    "DECK", "NU", "BABA", "PDD", "JD", "SE", "MELI", "IONQ", "RGTI", "OKLO",
+    "SMR", "HIMS", "RDDT", "ASTS", "NBIS", "ALAB", "CLS", "CRWV", "WBD", "T",
+    "VZ", "TMUS", "CMCSA", "CHTR", "F", "GM", "NEE", "DUK", "SO", "AMT",
+    "PLD", "EQIX", "SPG", "O", "LIN", "APD", "FCX", "NEM", "DOW", "NUE",
+]
 
 
 class ClaudeBot:
-    """
-    ClaudeBot v4 - Low-Turnover Long/Short Trend Basket (24/7 server engine).
-
-    Core idea: with a 0.1% fee on every trade, the biggest controllable edge
-    is trading RARELY. The bot holds a small basket of the strongest-trending
-    stocks for hours or days, can short the weakest when the whole market is
-    falling, and only acts when a trend is clear on 15-minute candles.
-
-    Signals only - the engine's broker does sizing, fees and accounting.
-    A signal is sent only when the bot wants a position to change.
-
-    Indicators per stock (15-minute candles built from engine timestamps):
-        fast EMA 12 candles (3 h), slow EMA 40 candles (10 h, ~1.5 trading
-        days), ATR 14 candles, 2-hour Efficiency Ratio (cleanliness of move).
-
-    LONG  when: fast EMA > slow EMA, price above both, slow EMA rising over
-                the last hour, the move is reasonably clean, the price isn't
-                overstretched, and at least half the watchlist trends up.
-    SHORT when: the mirror image, and at least 60% of the watchlist trends
-                down (shorting fights the market's natural upward drift, so
-                it needs a clearly weak market).
-    EXIT  when: the trend flips (checked each 15-minute candle), or the
-                trailing stop (4 ATRs behind the best price) is hit, or the
-                stock reports earnings that evening (gap protection).
-
-    Positions are held overnight - that is where much of the stock market's
-    long-run return comes from, and it halves the number of fees paid -
-    except into a known earnings report. Trading decisions are only made
-    during regular US hours (9:30am-4pm New York), never on thin pre-market
-    or after-hours prices. At most 4 positions, 1 new position per candle,
-    and 1 entry per stock per day.
-    """
+    STATE_VERSION = 1
 
     def __init__(self):
-        # Large, liquid, easy-to-short stocks across several sectors.
-        self.watchlist = ["NVDA", "AMD", "AVGO", "MU", "TSLA", "AAPL", "MSFT",
-                          "AMZN", "META", "GOOGL", "NFLX", "PLTR", "COIN",
-                          "ORCL", "CRM", "JPM", "XOM", "LLY", "UNH", "COST"]
+        self.watchlist = list(SEEDS[:30])
+        self.status = "Starting up - scanning the market"
 
-        # Signal words sent to the engine.
-        self.SIG_OPEN_LONG = "BUY"
-        self.SIG_CLOSE_LONG = "SELL"
-        self.SIG_OPEN_SHORT = "SHORT"
-        self.SIG_CLOSE_SHORT = "BUY"     # buy-to-cover; change here if the
-                                         # engine expects e.g. "COVER"
+        # Stock filters
+        self.MIN_DOLLAR_VOLUME = 25e6
+        self.MIN_PRICE = 5.0
+        self.SHORT_MIN_DOLLAR_VOLUME = 50e6
+        self.SHORT_MIN_PRICE = 10.0
+        self.MIN_HISTORY_DAYS = 105
+        self.MAX_WEEK_GAIN_TO_BUY = 0.20      # don't chase a stock up 20%+ in a week
+        self.MAX_WEEK_DROP_TO_SHORT = 0.20    # don't short one down 20%+ in a week
 
-        # Strategy parameters.
-        self.BAR_SECONDS = 900           # 15-minute candles
-        self.FAST_SPAN = 12
-        self.SLOW_SPAN = 40
-        self.ATR_PERIOD = 14
-        self.SLOPE_LOOKBACK = 4          # slow EMA direction over 1 hour
-        self.ER_WINDOW = 8               # efficiency ratio over 2 hours
-        self.MIN_ER = 0.20
-        self.WARMUP_BARS = 16            # 4 hours of live candles per stock
-        self.STOP_ATR_MULT = 4.0
-        self.MIN_STOP_PCT = 0.008        # skip stocks too quiet to beat fees
-        self.MAX_STRETCH_ATR = 3.0
-        self.COOLDOWN_BARS = 4           # 1 hour before re-entering a stock
-        self.MAX_POSITIONS = 4
-        self.MAX_NEW_PER_BAR = 1
-        self.MAX_ENTRIES_PER_DAY = 1     # per stock
-        self.LONG_BREADTH = 0.50
-        self.SHORT_BREADTH = 0.60
-        self.ALLOW_SHORTS = True
-        self.SPIKE_LIMIT = 0.12          # ignore unconfirmed 12%+ jumps
-        self.SPIKE_CONFIRM = 0.02
+        # Portfolio by market mood: (number of longs, long exposure,
+        #                            number of shorts, short exposure)
+        self.PLAN = {"BULL": (8, 0.95, 0, 0.00),
+                     "NEUTRAL": (5, 0.60, 0, 0.00),
+                     "BEAR": (2, 0.20, 4, 0.40)}
+        self.KEEP_RANK = 20                    # holdings kept while in the top 20
+        self.REBALANCE_TOLERANCE = 0.30        # ignore weight drifts under 30%
+        self.MIN_LIQUID_STOCKS = 120           # needed before trusting the mood
+        self.REBALANCE_FROM = 10 * 60          # 10:00 New York
+        self.REBALANCE_UNTIL = 15 * 60 + 30    # 15:30 New York
 
-        # Earnings dates (New York date of the report). If the report is
-        # after the close, the stock is closed out by 3:55pm that day and
-        # not bought or shorted that day. Covers the tournament window.
-        self.EARNINGS = {"NVDA": "2026-11-17"}
+        # Risk
+        self.LONG_STOP_ATR = 3.0
+        self.SHORT_STOP_ATR = 2.5
+        self.MAX_SHORT_LOSS = 0.12
+        self.COOLDOWN_DAYS = 3
+        self.DRAWDOWN_BRAKE = 0.08
+        self.BRAKE_RELEASE = 0.03
+        self.MAX_PENDING_TRIES = 6
 
-        # US market calendar (New York time, minutes after midnight).
-        self.SESSION_OPEN = 9 * 60 + 30
-        self.SESSION_CLOSE = 16 * 60
-        self.HALF_DAY_CLOSE = 13 * 60
-        self.NO_ENTRY_BEFORE = 9 * 60 + 45
-        self.ENTRY_CUTOFF_MINUTES = 30       # no new trades in the last 30 min
-        self.EARNINGS_EXIT_MINUTES = 5       # exit this long before the close
-        self.HOLIDAYS = {"2026-11-26", "2026-12-25", "2027-01-01",
-                         "2027-01-18", "2027-02-15"}
-        self.HALF_DAYS = {"2026-11-27", "2026-12-24"}
+        self._st = None
+        self._file = None
+        self._last_save = 0.0
+        self._queue = None
+        self._queue_day = None
+        self._priority_len = 0
+        self._queue_pos = 0
+        self._batch = {}          # symbol -> cycles waited for its data
 
+    # =====================================================================
+    # Engine entry point
+    # =====================================================================
+    def market_tick(self, data):
+        # Each stage is protected separately, so a problem in one can never
+        # stop the others - above all, stop-loss orders always go out.
+        errors = []
+        orders = []
         try:
-            from zoneinfo import ZoneInfo
-            self._new_york = ZoneInfo("America/New_York")
-        except Exception:
-            self._new_york = None
+            if self._st is None:
+                self._load(data.get("storage_dir"))
+            market = data["market"]
+            day = market["new_york_date"]
+            hh, mm = market["new_york_time"].split(":")[:2]
+            mins = int(hh) * 60 + int(mm)
+        except Exception as e:
+            self.status = f"Couldn't read the market data ({type(e).__name__}: {e}) - holding"[:300]
+            return []
+        st = self._st
+        if st["day"] != day:
+            st["day"] = day
+            st["scanned"] = {}
+            st["pending"] = {}
 
-        # Internal state.
-        self.tick_count = 0
-        self.last_prices = {}
-        self._pending = {}
-        self._state = {}
-        self._positions = {}             # sym -> {"side","entry","extreme","stop"}
-        self._entries_today = {}
-        self._day = None
-        self.signal_log = []
-
-    # ======================================================================
-    # Main entry point
-    # ======================================================================
-    def market_tick(self, prices_dict, timestamp_utc=None):
-        """Receive {symbol: price} for the watchlist plus a UTC timestamp.
-        Returns {symbol: "BUY" | "SELL" | "SHORT"} only when something
-        should change; an empty dict means hold everything as it is."""
-        if not isinstance(prices_dict, dict):
-            return {}
-
-        now = self._parse_time(timestamp_utc)
-        self.tick_count += 1
-        weekday, mins, day = self._new_york_time(now)
-        if day != self._day:
-            self._day = day
-            self._entries_today = {}
-        bar_id = int(now // self.BAR_SECONDS)
-
-        closed = set()
-        for sym, raw in prices_dict.items():
-            if sym not in self._state:
-                self._state[sym] = self._new_state()
-            price = self._clean_price(sym, raw)
-            if price is None:
-                continue
-            if self._update_bar(sym, price, bar_id):
-                closed.add(sym)
-
-        # Never act on pre-market / after-hours / holiday prices.
-        if not self._in_session(weekday, mins, day):
-            return {}
-
-        signals = {}
-        for sym in list(self._positions):
-            price = self.last_prices.get(sym)
-            if price is None:
-                continue
-            sig = self._manage_position(sym, price, sym in closed, mins, day)
-            if sig:
-                signals[sym] = sig
-
-        if (closed and len(self._positions) < self.MAX_POSITIONS
-                and self._may_enter(mins, day)):
-            up_share, down_share = self._breadth()
-            candidates = []
-            for sym in closed:
-                if sym in self._positions or sym in signals:
-                    continue
-                if self.EARNINGS.get(sym) == day:
-                    continue
-                side, score = self._entry_signal(sym, up_share, down_share)
-                if side:
-                    candidates.append((score, sym, side))
-            candidates.sort(reverse=True)
-            opened = 0
-            for _, sym, side in candidates:
-                if (len(self._positions) >= self.MAX_POSITIONS
-                        or opened >= self.MAX_NEW_PER_BAR):
-                    break
-                signals[sym] = self._open(sym, side)
-                opened += 1
-
-        return signals
-
-    def get_portfolio_value(self, prices_dict=None):
-        """The central broker values the portfolio from its own books."""
-        return 0.0
-
-    # ======================================================================
-    # Time and market calendar
-    # ======================================================================
-    def _parse_time(self, ts):
-        """Accepts ISO strings ('2026-11-10T17:24:00Z', with or without an
-        offset or fractional seconds), epoch seconds/milliseconds, or a
-        datetime. Falls back to the server clock if unreadable."""
-        try:
-            if ts is None:
-                return time.time()
-            if isinstance(ts, datetime):
-                dt = ts
-            elif isinstance(ts, (int, float)):
-                v = float(ts)
-                return v / 1000.0 if v > 1e11 else v
-            else:
-                text = str(ts).strip()
-                try:
-                    v = float(text)
-                    return v / 1000.0 if v > 1e11 else v
-                except ValueError:
-                    pass
-                text = text.replace("Z", "+00:00").replace(" UTC", "+00:00")
-                if "." in text:
-                    head, _, tail = text.partition(".")
-                    digits, rest = "", ""
-                    for i, ch in enumerate(tail):
-                        if ch.isdigit():
-                            digits += ch
-                        else:
-                            rest = tail[i:]
-                            break
-                    text = head + "." + (digits[:6] or "0") + rest
-                dt = datetime.fromisoformat(text)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
-        except Exception:
-            return time.time()
-
-    def _new_york_time(self, now):
-        if self._new_york is not None:
-            dt = datetime.fromtimestamp(now, tz=self._new_york)
-        else:
-            # No timezone database: US daylight saving runs from the 2nd
-            # Sunday of March to the 1st Sunday of November.
-            utc = datetime.fromtimestamp(now, tz=timezone.utc)
-            march = datetime(utc.year, 3, 8, 7, tzinfo=timezone.utc)
-            dst_start = march + timedelta(days=(6 - march.weekday()) % 7)
-            nov = datetime(utc.year, 11, 1, 6, tzinfo=timezone.utc)
-            dst_end = nov + timedelta(days=(6 - nov.weekday()) % 7)
-            offset = -4 if dst_start <= utc < dst_end else -5
-            dt = utc.astimezone(timezone(timedelta(hours=offset)))
-        return dt.weekday(), dt.hour * 60 + dt.minute, dt.strftime("%Y-%m-%d")
-
-    def _close_time(self, day):
-        return self.HALF_DAY_CLOSE if day in self.HALF_DAYS else self.SESSION_CLOSE
-
-    def _in_session(self, weekday, mins, day):
-        if weekday >= 5 or day in self.HOLIDAYS:
-            return False
-        return self.SESSION_OPEN <= mins < self._close_time(day)
-
-    def _may_enter(self, mins, day):
-        cutoff = self._close_time(day) - self.ENTRY_CUTOFF_MINUTES
-        return self.NO_ENTRY_BEFORE <= mins < cutoff
-
-    # ======================================================================
-    # Price hygiene
-    # ======================================================================
-    def _clean_price(self, sym, raw):
-        try:
-            p = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(p) or p <= 0:
-            return None
-        last = self.last_prices.get(sym)
-        if last is not None and abs(p / last - 1) > self.SPIKE_LIMIT:
-            pending = self._pending.get(sym)
-            if pending is not None and abs(p / pending - 1) <= self.SPIKE_CONFIRM:
-                self._pending.pop(sym, None)       # confirmed genuine jump
-            else:
-                self._pending[sym] = p
+        def guarded(name, fn, *args):
+            try:
+                return fn(*args)
+            except Exception as e:
+                errors.append(f"{name}: {type(e).__name__}: {e}")
                 return None
-        else:
-            self._pending.pop(sym, None)
-        self.last_prices[sym] = p
-        return p
 
-    # ======================================================================
-    # Candles and indicators
-    # ======================================================================
-    def _new_state(self):
-        return {"bar_id": None, "high": None, "low": None, "close": None,
-                "prev_close": None, "after_gap": False, "bars": 0,
-                "ema_fast": None, "ema_slow": None, "atr": None,
-                "slow_hist": deque(maxlen=self.SLOPE_LOOKBACK + 1),
-                "closes": deque(maxlen=self.ER_WINDOW + 1),
-                "last_exit_bar": -10**9}
+        guarded("scan", self._ingest, data, day)
+        if market["is_open"]:
+            guarded("equity", self._track_equity, data["account"])
+            orders += guarded("stops", self._protect, data, day) or []
+            if (st["last_rebalance"] != day
+                    and self.REBALANCE_FROM <= mins < self.REBALANCE_UNTIL):
+                orders += guarded("rebalance", self._rebalance, data, day,
+                                  {o["symbol"] for o in orders}) or []
+            busy = {o["symbol"] for o in orders}
+            orders += guarded("orders", self._work_pending, data, busy,
+                              max(0, 20 - len(orders))) or []
+        guarded("watchlist", self._plan_watchlist, data, day, market["is_open"])
+        guarded("status", self._set_status, data, day, mins)
+        if errors:
+            self.status = ("Problem: " + " | ".join(errors) + " || " + (self.status or ""))[:300]
+        guarded("save", self._save)
+        return orders
 
-    def _update_bar(self, sym, price, bar_id):
-        s = self._state[sym]
-        if s["bar_id"] is None:
-            s["bar_id"] = bar_id
-            s["high"] = s["low"] = s["close"] = price
-            return False
-        if bar_id <= s["bar_id"]:
-            s["high"] = max(s["high"], price)
-            s["low"] = min(s["low"], price)
-            s["close"] = price
-            return False
-        completed = self._close_bar(s)
-        s["bar_id"] = bar_id
-        s["high"] = s["low"] = s["close"] = price
-        return completed
+    # =====================================================================
+    # Scanning
+    # =====================================================================
+    def _metrics(self, bars, day):
+        rows = [b for b in bars if b[0] < day]          # completed days only
+        if len(rows) < self.MIN_HISTORY_DAYS:
+            return {"ok": False, "d": rows[-1][0] if rows else ""}
+        c = [float(r[4]) for r in rows]
+        h = [float(r[2]) for r in rows]
+        lo = [float(r[3]) for r in rows]
+        v = [float(r[5]) for r in rows]
+        n = len(c)
+        price = c[-1]
+        if price <= 0:
+            return {"ok": False, "d": rows[-1][0]}
+        dollar_volume = median(c[i] * v[i] for i in range(n - 20, n))
+        rets = [c[i] / c[i - 1] - 1 for i in range(n - 60, n) if c[i - 1] > 0]
+        mean_r = sum(rets) / len(rets)
+        vol = math.sqrt(sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)) * math.sqrt(252)
+        long_ret = c[-6] / c[-min(n, 121)] - 1
+        mid_ret = c[-6] / c[-64] - 1
+        tr = [max(h[i] - lo[i], abs(h[i] - c[i - 1]), abs(lo[i] - c[i - 1]))
+              for i in range(n - 14, n)]
+        return {
+            "ok": True,
+            "d": rows[-1][0],
+            "p": round(price, 4),
+            "dv": round(dollar_volume),
+            "s50": round(sum(c[-50:]) / 50, 4),
+            "s100": round(sum(c[-100:]) / 100, 4),
+            "vol": round(vol, 4),
+            "score": round((0.5 * long_ret + 0.5 * mid_ret) / max(vol, 0.15), 4),
+            "r5": round(c[-1] / c[-6] - 1, 4),
+            "r20": round(c[-1] / c[-21] - 1, 4),
+            "atr": round(sum(tr) / len(tr) / price, 5),
+        }
 
-    def _close_bar(self, s):
-        h, l, c, pc = s["high"], s["low"], s["close"], s["prev_close"]
-        if h == l and (pc is None or c == pc):          # frozen: market shut
-            if pc is not None:
-                s["after_gap"] = True
-            return False
-        if pc is None or s["after_gap"]:
-            tr = h - l
-        else:
-            tr = max(h - l, abs(h - pc), abs(l - pc))
-        s["after_gap"] = False
-
-        s["atr"] = tr if s["atr"] is None else s["atr"] + (tr - s["atr"]) / self.ATR_PERIOD
-        if s["ema_fast"] is None:
-            s["ema_fast"] = s["ema_slow"] = c
-        else:
-            s["ema_fast"] += 2.0 / (self.FAST_SPAN + 1) * (c - s["ema_fast"])
-            s["ema_slow"] += 2.0 / (self.SLOW_SPAN + 1) * (c - s["ema_slow"])
-        s["slow_hist"].append(s["ema_slow"])
-        s["closes"].append(c)
-        s["prev_close"] = c
-        s["bars"] += 1
-        return True
-
-    def _efficiency_ratio(self, s):
-        p = list(s["closes"])
-        if len(p) < 2:
-            return 0.0
-        path = sum(abs(p[i] - p[i - 1]) for i in range(1, len(p)))
-        return abs(p[-1] - p[0]) / path if path > 0 else 0.0
-
-    def _breadth(self):
-        up = down = total = 0
-        for s in self._state.values():
-            if s["bars"] < self.WARMUP_BARS or s["ema_fast"] is None:
+    def _ingest(self, data, day):
+        st = self._st
+        held = set(data["account"]["positions"])
+        for sym, bars in data.get("daily_bars", {}).items():
+            if not bars or st["scanned"].get(sym) == day:
                 continue
-            total += 1
-            if s["ema_fast"] > s["ema_slow"]:
-                up += 1
-            elif s["ema_fast"] < s["ema_slow"]:
-                down += 1
-        if total == 0:
-            return 0.0, 0.0
-        return up / total, down / total
+            m = self._metrics(bars, day)
+            st["scan"][sym] = m
+            st["scanned"][sym] = day
+            self._batch.pop(sym, None)
+        for sym in list(self._batch):
+            if st["scanned"].get(sym) == day:
+                self._batch.pop(sym, None)
+                continue
+            self._batch[sym] += 1
+            if self._batch[sym] >= 3:                    # no data came - skip today
+                st["scanned"][sym] = day
+                self._batch.pop(sym, None)
+        for sym in data.get("watchlist_status", {}).get("rejected", {}):
+            st["scanned"][sym] = day
+            self._batch.pop(sym, None)
+            st["scan"].pop(sym, None)
+        for sym in held:                                 # always know held stocks
+            if sym not in st["scan"]:
+                st["scanned"].pop(sym, None)
 
-    # ======================================================================
-    # Trading decisions
-    # ======================================================================
-    def _entry_signal(self, sym, up_share, down_share):
-        s = self._state[sym]
-        if (s["bars"] < self.WARMUP_BARS
-                or len(s["slow_hist"]) <= self.SLOPE_LOOKBACK
-                or len(s["closes"]) <= self.ER_WINDOW):
-            return None, 0.0
-        if s["bars"] - s["last_exit_bar"] < self.COOLDOWN_BARS:
-            return None, 0.0
-        if self._entries_today.get(sym, 0) >= self.MAX_ENTRIES_PER_DAY:
-            return None, 0.0
+    def _build_queue(self, data, day):
+        universe = data.get("universe") or {}
+        complete = bool(data.get("universe_complete")) and len(universe) > 0
+        movers = []
+        for lst in (data.get("movers") or {}).values():
+            for q in lst:
+                if q.get("tradable") and q.get("symbol"):
+                    movers.append(q["symbol"])
+        known_liquid = sorted((s for s, m in self._st["scan"].items()
+                               if m.get("ok") and m.get("dv", 0) >= self.MIN_DOLLAR_VOLUME),
+                              key=lambda s: -self._st["scan"][s]["dv"])
+        priority, seen = [], set()
+        for s in SEEDS + movers + known_liquid:
+            if s not in seen and (not complete or s in universe):
+                priority.append(s)
+                seen.add(s)
+        rest = []
+        if complete:
+            rest = sorted((s for s in universe if s not in seen),
+                          key=lambda s: hashlib.md5((s + day).encode()).hexdigest())
+        self._queue = priority + rest
+        self._priority_len = len(priority)
+        self._queue_pos = 0
+        self._queue_day = day
 
-        price = self.last_prices.get(sym)
-        atr = s["atr"]
-        if price is None or not atr or atr <= 0:
-            return None, 0.0
-        if self.STOP_ATR_MULT * atr / price < self.MIN_STOP_PCT:
-            return None, 0.0
-        er = self._efficiency_ratio(s)
-        if er < self.MIN_ER:
-            return None, 0.0
+    def _plan_watchlist(self, data, day, is_open):
+        st = self._st
+        if self._queue is None or self._queue_day != day:
+            self._build_queue(data, day)
+        held = set(data["account"]["positions"])
+        needed = [s for s in st["pending"] if s not in held][:30]
+        slots = 30 - len(needed) - len(self._batch)
+        # While the market is open, only the priority list is scanned (and only
+        # until it's done), to keep the engine's data downloads light.
+        limit = self._priority_len if is_open else len(self._queue)
+        while slots > 0 and self._queue_pos < limit:
+            sym = self._queue[self._queue_pos]
+            self._queue_pos += 1
+            if st["scanned"].get(sym) == day or sym in held or sym in self._batch:
+                continue
+            self._batch[sym] = 0
+            slots -= 1
+        self.watchlist = needed + list(self._batch)
 
-        fast, slow = s["ema_fast"], s["ema_slow"]
-        strength = (fast - slow) / atr
-        stretch = (price - fast) / atr
-        rising = s["slow_hist"][-1] > s["slow_hist"][0]
-        falling = s["slow_hist"][-1] < s["slow_hist"][0]
+    # =====================================================================
+    # Market mood and ranking
+    # =====================================================================
+    def _fresh_liquid(self):
+        scan = self._st["scan"]
+        good = {s: m for s, m in scan.items()
+                if m.get("ok") and all(k in m for k in ("d", "p", "dv", "s50", "s100", "score", "r5", "r20"))}
+        if not good:
+            return {}, ""
+        latest = max(m["d"] for m in good.values())
+        return ({s: m for s, m in good.items()
+                 if m["d"] == latest and m["dv"] >= self.MIN_DOLLAR_VOLUME
+                 and m["p"] >= self.MIN_PRICE}, latest)
 
-        if (fast > slow and price > fast and rising
-                and stretch <= self.MAX_STRETCH_ATR
-                and up_share >= self.LONG_BREADTH):
-            return "LONG", strength * er
-        if (self.ALLOW_SHORTS and fast < slow and price < fast and falling
-                and -stretch <= self.MAX_STRETCH_ATR
-                and down_share >= self.SHORT_BREADTH):
-            return "SHORT", -strength * er
-        return None, 0.0
-
-    def _open(self, sym, side):
-        price = self.last_prices[sym]
-        atr = self._state[sym]["atr"]
-        if side == "LONG":
-            stop, signal = price - self.STOP_ATR_MULT * atr, self.SIG_OPEN_LONG
+    def _mood(self, liquid):
+        if len(liquid) < self.MIN_LIQUID_STOCKS:
+            return None, 0.0, 0.0
+        breadth = sum(1 for m in liquid.values() if m["p"] > m["s50"]) / len(liquid)
+        biggest = sorted(liquid.values(), key=lambda m: -m["dv"])[:150]
+        typical_20d = median(m["r20"] for m in biggest)
+        if breadth >= 0.50 and typical_20d >= 0:
+            mood = "BULL"
+        elif breadth < 0.35 and typical_20d < 0:
+            mood = "BEAR"
         else:
-            stop, signal = price + self.STOP_ATR_MULT * atr, self.SIG_OPEN_SHORT
-        self._positions[sym] = {"side": side, "entry": price,
-                                "extreme": price, "stop": stop}
-        self._entries_today[sym] = self._entries_today.get(sym, 0) + 1
-        self.signal_log.append({"tick": self.tick_count, "day": self._day,
-                                "symbol": sym, "signal": signal,
-                                "side": side, "price": price})
-        return signal
+            mood = "NEUTRAL"
+        return mood, breadth, typical_20d
 
-    def _close(self, sym, price, reason):
-        pos = self._positions.pop(sym)
-        self._state[sym]["last_exit_bar"] = self._state[sym]["bars"]
-        signal = self.SIG_CLOSE_LONG if pos["side"] == "LONG" else self.SIG_CLOSE_SHORT
-        move = price / pos["entry"] - 1
-        if pos["side"] == "SHORT":
-            move = -move
-        self.signal_log.append({"tick": self.tick_count, "day": self._day,
-                                "symbol": sym, "signal": signal,
-                                "side": pos["side"], "price": price,
-                                "reason": reason,
-                                "move_pct": round(move * 100, 3)})
-        return signal
+    def _cooling(self, sym, day):
+        when = self._st["cooldown"].get(sym)
+        if not when:
+            return False
+        try:
+            return (date.fromisoformat(day) - date.fromisoformat(when)).days < self.COOLDOWN_DAYS + 1
+        except ValueError:
+            return False
 
-    def _manage_position(self, sym, price, bar_closed, mins, day):
-        pos = self._positions[sym]
-        s = self._state[sym]
-        atr = s["atr"]
+    # =====================================================================
+    # Daily rebalance
+    # =====================================================================
+    def _rebalance(self, data, day, already_exiting):
+        st = self._st
+        liquid, _ = self._fresh_liquid()
+        mood, breadth, typical = self._mood(liquid)
+        if mood is None:
+            return []                                    # not enough data yet
+        if st["brake"] and mood == "BULL":
+            mood = "NEUTRAL"
+        st["mood"], st["breadth"], st["typical_20d"] = mood, breadth, typical
 
-        if pos["side"] == "LONG":
-            if price > pos["extreme"]:
-                pos["extreme"] = price
-            if atr:
-                pos["stop"] = max(pos["stop"], pos["extreme"] - self.STOP_ATR_MULT * atr)
-            if price <= pos["stop"]:
-                return self._close(sym, price, "STOP")
+        account = data["account"]
+        equity = account["equity"]
+        positions = account["positions"]
+        n_long, long_exp, n_short, short_exp = self.PLAN[mood]
+
+        longs = sorted(
+            (s for s, m in liquid.items()
+             if m["p"] > m["s50"] > m["s100"] and m["score"] > 0
+             and m["r5"] < self.MAX_WEEK_GAIN_TO_BUY and not self._cooling(s, day)),
+            key=lambda s: -liquid[s]["score"])
+        shorts = sorted(
+            (s for s, m in liquid.items()
+             if m["p"] < m["s50"] < m["s100"] and m["score"] < 0
+             and m["dv"] >= self.SHORT_MIN_DOLLAR_VOLUME and m["p"] >= self.SHORT_MIN_PRICE
+             and m["r5"] > -self.MAX_WEEK_DROP_TO_SHORT and not self._cooling(s, day)),
+            key=lambda s: liquid[s]["score"])
+
+        def choose(ranked, held, n):
+            rank = {s: i for i, s in enumerate(ranked)}
+            keep = sorted((s for s in held if rank.get(s, 10**6) < self.KEEP_RANK),
+                          key=lambda s: rank[s])[:n]
+            return keep + [s for s in ranked if s not in keep][:n - len(keep)]
+
+        held_long = [s for s, p in positions.items()
+                     if p["side"] == "LONG" and s not in already_exiting]
+        held_short = [s for s, p in positions.items()
+                      if p["side"] == "SHORT" and s not in already_exiting]
+        target_long = choose(longs, held_long, n_long) if n_long else []
+        target_short = choose(shorts, held_short, n_short) if n_short else []
+
+        orders = []
+        for s in held_long:
+            if s not in target_long:
+                orders.append({"symbol": s, "action": "SELL", "amount": "ALL"})
+        for s in held_short:
+            if s not in target_short:
+                orders.append({"symbol": s, "action": "COVER", "amount": "ALL"})
+
+        st["pending"] = {}
+        for targets, side, exposure, n in ((target_long, "LONG", long_exp, n_long),
+                                           (target_short, "SHORT", short_exp, n_short)):
+            if not n:
+                continue
+            each = exposure * equity / n
+            for s in targets:
+                current = abs(positions[s]["value"]) if s in positions else 0.0
+                gap = each - current
+                if gap > max(1.0, self.REBALANCE_TOLERANCE * each):
+                    st["pending"][s] = {"side": side, "target": each, "tries": 0}
+                elif -gap > max(1.0, self.REBALANCE_TOLERANCE * each):
+                    action = "SELL" if side == "LONG" else "COVER"
+                    orders.append({"symbol": s, "action": action, "amount": round(-gap, 2)})
+        st["last_rebalance"] = day
+        st["targets"] = {"long": target_long, "short": target_short}
+        self._last_save = 0.0
+        return orders
+
+    def _work_pending(self, data, busy, max_orders):
+        st = self._st
+        account = data["account"]
+        positions = account["positions"]
+        prices = data.get("prices", {})
+        cash = account["cash"]
+        room = account["max_new_short"]                  # gross exposure headroom
+        orders = []
+        for sym, p in list(st["pending"].items()):
+            if sym in busy or len(orders) >= max_orders:
+                continue
+            pos = positions.get(sym)
+            if pos and pos["side"] != p["side"]:
+                continue                                 # wait until it's closed
+            need = p["target"] - (abs(pos["value"]) if pos else 0.0)
+            if need < max(1.0, 0.1 * p["target"]) or p["tries"] >= self.MAX_PENDING_TRIES:
+                st["pending"].pop(sym)
+                continue
+            price = prices.get(sym)
+            if not price:
+                continue                                 # data arrives next cycle
+            if p["side"] == "LONG":
+                amount = min(need, cash / 1.001 - 0.01, room)
+            else:
+                amount = min(need, room)
+            if amount < 1.0:
+                p["tries"] += 1
+                continue
+            amount = round(amount, 2)
+            orders.append({"symbol": sym,
+                           "action": "BUY" if p["side"] == "LONG" else "SHORT",
+                           "amount": amount})
+            p["tries"] += 1
+            room -= amount
+            cash += -amount * 1.001 if p["side"] == "LONG" else amount * 0.999
+        return orders
+
+    # =====================================================================
+    # Protection
+    # =====================================================================
+    def _track_equity(self, account):
+        st = self._st
+        equity = account["equity"]
+        st["peak"] = max(st["peak"], equity)
+        if equity < st["peak"] * (1 - self.DRAWDOWN_BRAKE):
+            st["brake"] = True
+        elif equity >= st["peak"] * (1 - self.BRAKE_RELEASE):
+            st["brake"] = False
+
+    def _protect(self, data, day):
+        st = self._st
+        orders = []
+        positions = data["account"]["positions"]
+        for sym in list(st["trail"]):
+            if sym not in positions:
+                st["trail"].pop(sym)
+        for sym, pos in positions.items():
+            price = pos["price"]
+            trail = st["trail"].get(sym)
+            if not trail or trail["side"] != pos["side"]:
+                trail = st["trail"][sym] = {"side": pos["side"], "x": price}
+            atr = (st["scan"].get(sym) or {}).get("atr") or 0.03
+            if pos["side"] == "LONG":
+                trail["x"] = max(trail["x"], price)
+                if price <= trail["x"] * (1 - self.LONG_STOP_ATR * atr):
+                    orders.append({"symbol": sym, "action": "SELL", "amount": "ALL"})
+            else:
+                trail["x"] = min(trail["x"], price)
+                if (price >= trail["x"] * (1 + self.SHORT_STOP_ATR * atr)
+                        or price >= pos["avg_price"] * (1 + self.MAX_SHORT_LOSS)):
+                    orders.append({"symbol": sym, "action": "COVER", "amount": "ALL"})
+        for o in orders:
+            st["cooldown"][o["symbol"]] = day
+            st["pending"].pop(o["symbol"], None)
+        return orders
+
+    # =====================================================================
+    # Status, saving and loading
+    # =====================================================================
+    def _set_status(self, data, day, mins):
+        st = self._st
+        liquid, _ = self._fresh_liquid()
+        today = sum(1 for d in st["scanned"].values() if d == day)
+        pos = data["account"]["positions"]
+        n_long = sum(1 for p in pos.values() if p["side"] == "LONG")
+        n_short = len(pos) - n_long
+        mood = st.get("mood") or "not decided yet"
+        if st["last_rebalance"] == day:
+            plan = "rebalanced today"
+        elif data["market"]["is_open"] and mins >= self.REBALANCE_FROM:
+            plan = (f"waiting for data ({len(liquid)}/{self.MIN_LIQUID_STOCKS} liquid stocks)"
+                    if len(liquid) < self.MIN_LIQUID_STOCKS else "rebalancing")
         else:
-            if price < pos["extreme"]:
-                pos["extreme"] = price
-            if atr:
-                pos["stop"] = min(pos["stop"], pos["extreme"] + self.STOP_ATR_MULT * atr)
-            if price >= pos["stop"]:
-                return self._close(sym, price, "STOP")
+            plan = "next rebalance 10:00 New York"
+        brake = " | drawdown brake ON" if st["brake"] else ""
+        self.status = (f"Mood {mood} (breadth {st.get('breadth', 0):.0%}) | {n_long} long, "
+                       f"{n_short} short | {len(liquid)} liquid stocks ranked, {today} scanned "
+                       f"today | {plan}{brake}")[:300]
 
-        if (self.EARNINGS.get(sym) == day
-                and mins >= self._close_time(day) - self.EARNINGS_EXIT_MINUTES):
-            return self._close(sym, price, "EARNINGS")
+    def _fresh_state(self):
+        return {"version": self.STATE_VERSION, "day": "", "scan": {}, "scanned": {},
+                "pending": {}, "trail": {}, "cooldown": {}, "last_rebalance": "",
+                "peak": 100.0, "brake": False, "mood": None, "breadth": 0.0,
+                "typical_20d": 0.0, "targets": {}}
 
-        if bar_closed and s["ema_fast"] is not None:
-            if pos["side"] == "LONG" and s["ema_fast"] < s["ema_slow"]:
-                return self._close(sym, price, "TREND_END")
-            if pos["side"] == "SHORT" and s["ema_fast"] > s["ema_slow"]:
-                return self._close(sym, price, "TREND_END")
-        return None
+    def _load(self, storage_dir):
+        self._st = self._fresh_state()
+        if not storage_dir:
+            return
+        self._file = os.path.join(storage_dir, "claude_state.json")
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if saved.get("version") == self.STATE_VERSION:
+                self._st.update(saved)
+        except Exception:
+            pass
+
+    def _save(self):
+        if not self._file or time.time() - self._last_save < 60:
+            return
+        self._last_save = time.time()
+        try:
+            os.makedirs(os.path.dirname(self._file), exist_ok=True)
+            tmp = self._file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._st, f)
+            os.replace(tmp, self._file)
+        except Exception:
+            pass
