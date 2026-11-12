@@ -603,6 +603,7 @@ class Engine:
         self.price_interval = 0.0     # extra seconds between price refreshes (0 = every cycle)
         self.fetch_ok_streak = 0
         self.gap_recheck = {}
+        self.cycles_since_close = 0
         if self.state["history"]:
             last = parse_iso(self.state["history"][-1].get("t"))
             self.last_snapshot = last.timestamp() if last else 0.0
@@ -614,7 +615,8 @@ class Engine:
     def _fresh_state():
         return {"version": 1, "created_utc": iso(utc_now()), "accounts": {},
                 "ledgers": {}, "history": [], "bots": {}, "engine": {},
-                "prices": {}, "price_times": {}, "summary": {}, "positions": {}}
+                "prices": {}, "price_times": {}, "summary": {}, "positions": {},
+                "daily_summaries": [], "day_open": {}}
 
     def _load_state(self):
         state = read_json(STATE_FILE)
@@ -1136,6 +1138,71 @@ class Engine:
         self.state["summary"] = summary
         self.state["positions"] = positions
 
+    def _daily_summary(self, market, now):
+        """Shortly after each close, record the day's results for every bot.
+        The dashboard shows these under "Daily summaries"."""
+        today = market["new_york_date"]
+        summary = self.state["summary"]
+        if market["is_open"]:
+            self.cycles_since_close = 0
+            if self.state.get("day_open", {}).get("date") != today:
+                self.state["day_open"] = {"date": today,
+                                          "equity": {n: s["equity"] for n, s in summary.items()}}
+            return
+        if not (market["session"] == "after-hours" and market["is_trading_day"]):
+            return
+        done = self.state.setdefault("daily_summaries", [])
+        if done and done[-1]["date"] == today:
+            return
+        self.cycles_since_close += 1
+        if self.cycles_since_close < 3:              # let the closing prices settle
+            return
+        previous = done[-1]["bots"] if done else {}
+        opened = self.state.get("day_open", {})
+        opened = opened.get("equity", {}) if opened.get("date") == today else {}
+        if not previous:                             # first summary: start from the last
+            opens_at = market.get("opens_at_utc") or ""   # chart point before today's open
+            earlier = [h for h in self.state["history"] if h.get("t", "") < opens_at]
+            if earlier:
+                opened = dict(opened, **{k: v for k, v in earlier[-1].items() if k != "t"})
+        bots = {}
+        for name, s in summary.items():
+            start = previous.get(name, {}).get("equity") or opened.get(name) or STARTING_CASH
+            rows = [r for r in self.state["ledgers"].get(name, [])
+                    if (parse_iso(r.get("time_utc")) and
+                        to_new_york(parse_iso(r["time_utc"])).strftime("%Y-%m-%d") == today)]
+            fills = [r for r in rows if r.get("status") == "FILLED"]
+            orders = {}
+            for r in fills:
+                orders[r["action"]] = orders.get(r["action"], 0) + 1
+            held = sorted(self.state["positions"].get(name, []), key=lambda p: p["unrealized_pnl"])
+            def brief(p):
+                return {"symbol": p["symbol"], "side": p["side"], "pnl": round(p["unrealized_pnl"], 2)}
+            bot = self.state["bots"].get(name, {})
+            bots[name] = {
+                "equity": round(s["equity"], 2),
+                "day_change": round(s["equity"] - start, 2),
+                "day_pct": round((s["equity"] / start - 1) * 100, 2) if start else 0.0,
+                "total_pct": round(s["return_pct"], 2),
+                "orders": orders,
+                "traded_value": round(sum(r.get("value") or 0 for r in fills), 2),
+                "fees": round(sum(r.get("fee") or 0 for r in fills), 3),
+                "realized": round(sum(r.get("realized_pnl") or 0 for r in fills), 2),
+                "rejected": sum(1 for r in rows if r.get("status") == "REJECTED"),
+                "margin_calls": sum(1 for r in fills if "MARGIN CALL" in str(r.get("reason"))),
+                "open_positions": len(held),
+                "long": round(s["long_exposure"], 2), "short": round(s["short_exposure"], 2),
+                "cash": round(s["cash"], 2),
+                "best": brief(held[-1]) if held else None,
+                "worst": brief(held[0]) if len(held) > 1 else None,
+                "error": bool(bot.get("error")) and str(bot.get("error_time_utc", ""))[:10] >= today,
+                "loaded": bool(bot.get("loaded")),
+            }
+        done.append({"date": today, "made_utc": iso(now), "half_day": market["is_half_day"],
+                     "bots": bots})
+        del done[:-60]
+        log(f"Daily summary recorded for {today}")
+
     def _snapshot_history(self, market, now):
         gap = EQUITY_SNAPSHOT_SECONDS if market["is_open"] else 3600
         if now.timestamp() - self.last_snapshot < gap:
@@ -1208,6 +1275,7 @@ class Engine:
             for slot in self.slots:
                 self._run_bot(slot, market, now)
         self._update_stats(market, now)
+        self._daily_summary(market, now)
         self._snapshot_history(market, now)
         self._save(market, now, self._tracked_symbols())
         return market

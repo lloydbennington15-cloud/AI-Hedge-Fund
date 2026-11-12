@@ -18,6 +18,7 @@ Opening the page in several tabs or devices at once is always safe.
 """
 
 import hmac
+import html
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from datetime import datetime, timezone
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import engine as E
 
@@ -239,6 +241,193 @@ auto = st.sidebar.toggle("Auto-refresh this page", value=True)
 
 
 # -----------------------------------------------------------------------------
+# The arcade panel: an animated summary drawn from the same saved data
+# -----------------------------------------------------------------------------
+ARCADE_CSS = """
+*{box-sizing:border-box}
+body{margin:0;background:#05050f;color:#fff;font-family:'Press Start 2P',ui-monospace,Menlo,Consolas,monospace}
+@keyframes step{0%,49%{transform:translateY(0)}50%,100%{transform:translateY(-3px)}}
+@keyframes jog{0%,100%{transform:translateX(0)}50%{transform:translateX(6px)}}
+@keyframes blink{0%,60%{opacity:1}61%,100%{opacity:0}}
+@keyframes snooze{0%{transform:translate(0,0);opacity:0}30%{opacity:1}100%{transform:translate(10px,-20px);opacity:0}}
+@keyframes ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.wrap{position:relative;min-width:680px;padding:16px 22px 44px 22px;overflow:hidden}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.title{font-size:16px;color:#facc15}
+.mid{font-size:9px;color:#cbd5e1}
+.sign{font-size:11px}
+.open{color:#4ade80;animation:blink 1.4s steps(1) infinite}
+.shut{color:#f87171}
+.key{margin-top:10px;font-size:8px;line-height:13px;color:#94a3b8}
+.track{position:relative;margin-top:8px;padding-top:14px}
+.start{position:absolute;top:0;bottom:0;width:0;border-left:3px dashed #22d3ee}
+.startlab{position:absolute;top:-2px;font-size:8px;color:#22d3ee;background:#05050f;padding:0 4px;transform:translateX(-50%);white-space:nowrap}
+.flag{position:absolute;right:0;top:14px;bottom:0;width:20px;background-image:repeating-conic-gradient(#fff 0 25%,#05050f 0 50%);background-size:20px 20px}
+.lane{position:relative;height:88px}
+.girder{position:absolute;left:200px;right:28px;top:52px;height:12px;background:repeating-linear-gradient(90deg,#e11d48 0 22px,#fb7185 22px 26px);border-top:3px solid #fda4af;border-bottom:3px solid #9f1239}
+.who{position:absolute;left:0;top:10px;width:192px;font-size:11px;line-height:17px;white-space:nowrap;overflow:hidden;filter:brightness(1.3)}
+.money{font-size:9px;color:#fff}
+.down{color:#fca5a5}
+.doing{position:absolute;left:200px;right:30px;top:71px;font-size:9px;line-height:13px;white-space:nowrap;overflow:hidden;filter:brightness(1.45)}
+.alert{color:#fca5a5 !important;animation:blink 1.4s steps(1) infinite}
+.bot{position:absolute;top:14px;width:30px;height:38px;animation:jog 1.2s steps(4) infinite}
+.head{position:absolute;left:4px;top:0;width:22px;height:14px;background:currentColor}
+.eye{position:absolute;top:4px;width:4px;height:5px;background:#fff}
+.body{position:absolute;left:1px;top:16px;width:28px;height:13px;background:currentColor;filter:brightness(.8)}
+.leg{position:absolute;top:31px;width:8px;height:7px;background:currentColor;animation:step .4s steps(1) infinite}
+.busy{animation-duration:.7s}.busy .leg{animation-duration:.25s}
+.calm{animation-duration:2s}.calm .leg{animation-duration:.7s}
+.asleep,.asleep .leg{animation:none}
+.asleep .eye{height:2px;top:7px}
+.zed{position:absolute;left:30px;top:-6px;font-size:10px;color:#e2e8f0;animation:snooze 2.4s linear infinite}
+.crates{position:absolute;left:34px;top:10px;display:flex;gap:4px}
+.crate{height:18px;border:3px solid #fde68a;background:#b45309;color:#fef3c7;font-size:7px;line-height:12px;padding:0 3px;white-space:nowrap}
+.iou{background:#1e1b4b;border-color:#a5b4fc;color:#e0e7ff}
+.tick{position:absolute;left:0;right:0;bottom:0;height:34px;overflow:hidden;background:#111827;border-top:3px solid #facc15}
+.tick div{display:flex;width:max-content;font-size:9px;line-height:31px;color:#fde68a;animation:ticker 40s linear infinite}
+.tick span{padding-right:48px;white-space:nowrap}
+"""
+
+
+def _arcade_activity(name, summary, bot, ledger, positions, market_open, now):
+    """One line saying what the bot is doing, plus its mood (busy/calm/asleep)."""
+    longs = sum(1 for p in positions if p["side"] == "LONG")
+    shorts = len(positions) - longs
+    if not bot.get("loaded"):
+        return "BOT FILE NOT LOADED", "asleep", True
+    recent = []
+    for row in ledger[:40]:
+        when = E.parse_iso(row.get("time_utc"))
+        if when and (now - when).total_seconds() <= 600:
+            recent.append(row)
+    if bot.get("error"):
+        err_time = E.parse_iso(bot.get("error_time_utc"))
+        if err_time and (now - err_time).total_seconds() <= 900:
+            return "BOT ERROR. SEE ITS DESK BELOW", "asleep", True
+    if recent:
+        row = recent[0]
+        sym = row.get("symbol") or ""
+        value = row.get("value") or 0
+        pnl = row.get("realized_pnl")
+        result = "" if pnl is None else (f". MADE ${pnl:.2f}" if pnl >= 0 else f". LOST ${-pnl:.2f}")
+        if row.get("status") == "REJECTED":
+            count = sum(1 for r in recent if r.get("status") == "REJECTED")
+            reason = str(row.get("reason") or "")
+            why = ("NOT ENOUGH CASH" if "too large" in reason or "not enough" in reason
+                   else reason.split(" - ")[0].upper()[:34])
+            return f"{count} ORDER{'S' if count != 1 else ''} REJECTED. {why}", "asleep", True
+        if row.get("action") == "BUY":
+            return f"BOUGHT {sym} ${value:.2f}", "busy", False
+        if row.get("action") == "SELL":
+            return f"SOLD {sym}{result}", "busy", False
+        if row.get("action") == "SHORT":
+            return f"SHORTED {sym} ${value:.2f}", "busy", False
+        if row.get("action") == "COVER":
+            return f"BOUGHT BACK {sym}{result}", "busy", False
+        if row.get("action") == "SPLIT":
+            return f"{sym} SPLIT. SHARES ADJUSTED", "calm", False
+    if not market_open:
+        held = f"HOLDING {len(positions)}" if positions else "ALL CASH"
+        return f"MARKET CLOSED. {held}", "asleep", False
+    if longs and shorts:
+        return f"HOLDING {longs} STOCKS, SHORT {shorts}", "calm", False
+    if shorts:
+        return f"SHORT {shorts} STOCK{'S' if shorts != 1 else ''}. OWES ${summary['short_exposure']:.2f}", "calm", False
+    if longs:
+        return f"HOLDING {longs} STOCK{'S' if longs != 1 else ''}", "calm", False
+    return "ALL CASH. WAITING FOR A CHANCE", "calm", False
+
+
+def arcade_html(state):
+    summary = state["summary"]
+    now = E.utc_now()
+    market = E.market_status(now)
+    ranked = sorted(summary.items(), key=lambda kv: -kv[1]["equity"])
+    equities = [s["equity"] for _, s in ranked] + [E.STARTING_CASH]
+    low, high = min(equities), max(equities)
+    if high - low < 0.5:                                  # zoom in when they're pennies apart
+        mid = (high + low) / 2
+        low, high = mid - 0.25, mid + 0.25
+    pad = (high - low) * 0.12
+    low, high = low - pad, high + pad * 2.2
+
+    def spot(equity):                                     # 0..1 along the track
+        return min(1.0, max(0.0, (equity - low) / (high - low)))
+
+    def left(fraction, offset=0):
+        return f"calc(200px + (100% - 330px) * {fraction:.4f} + {offset}px)"
+
+    lanes = []
+    for place, (name, s) in enumerate(ranked, start=1):
+        color = "#9ca3af" if name == "Grok" else COLORS.get(name, "#e5e7eb")   # grey needs lifting on black
+        positions = state.get("positions", {}).get(name, [])
+        text, mood, alert = _arcade_activity(name, s, state.get("bots", {}).get(name, {}),
+                                             state.get("ledgers", {}).get(name, []), positions,
+                                             market["is_open"], now)
+        longs = sum(1 for p in positions if p["side"] == "LONG")
+        shorts = len(positions) - longs
+        crates = (f'<div class="crate">x{longs}</div>' if longs else "") + \
+                 (f'<div class="crate iou">IOU x{shorts}</div>' if shorts else "")
+        down = " down" if s["return_pct"] < 0 else ""
+        lanes.append(
+            f'<div class="lane"><div class="who" style="color:{color}">{place} {html.escape(name.upper())}'
+            f'<div class="money{down}">${s["equity"]:.2f} {s["return_pct"]:+.2f}%</div></div>'
+            f'<div class="girder"></div>'
+            f'<div class="bot {mood}" style="left:{left(spot(s["equity"]), -15)};color:{color}">'
+            f'<div class="head"><div class="eye" style="left:4px"></div><div class="eye" style="left:14px"></div></div>'
+            f'<div class="body"></div><div class="leg" style="left:4px"></div>'
+            f'<div class="leg" style="left:18px;animation-delay:.2s"></div>'
+            + ('<div class="zed">Z</div>' if mood == "asleep" else "")
+            + (f'<div class="crates" style="left:{46 if mood == "asleep" else 34}px">{crates}</div>' if crates else "")
+            + f'</div><div class="doing{" alert" if alert else ""}" style="color:{color}">{html.escape(text)}</div></div>')
+
+    fills = []
+    for name, ledger in state.get("ledgers", {}).items():
+        for row in ledger[:15]:
+            if row.get("status") == "FILLED" and row.get("action") in ("BUY", "SELL", "SHORT", "COVER"):
+                fills.append((row.get("time_utc", ""), name, row))
+    fills.sort(key=lambda f: f[0], reverse=True)
+    words = {"BUY": "BOUGHT", "SELL": "SOLD", "SHORT": "SHORTED", "COVER": "BOUGHT BACK"}
+    items = []
+    for _, name, row in fills[:8]:
+        pnl = row.get("realized_pnl")
+        tail = f"${row.get('value') or 0:.2f}" if pnl is None else f"{'+' if pnl >= 0 else '-'}${abs(pnl):.2f}"
+        items.append(f"{name.upper()} {words[row['action']]} {row.get('symbol', '')} {tail}")
+    if len(ranked) > 1:
+        items.append(f"GAP FIRST TO LAST ${ranked[0][1]['equity'] - ranked[-1][1]['equity']:.2f}")
+    ticker = html.escape("LATEST: " + "  *  ".join(items)) if items else "NO TRADES YET"
+
+    day = len(state.get("daily_summaries", [])) + (1 if market["is_trading_day"] and
+                                                   market["session"] != "after-hours" else 0)
+    target = market.get("closes_at_utc") if market["is_open"] else (
+        market.get("opens_at_utc") if market["session"] == "pre-market" else "")
+    label = "CLOSES IN" if market["is_open"] else "OPENS IN"
+    sign = ('<div class="sign open">MARKET OPEN</div>' if market["is_open"]
+            else '<div class="sign shut">MARKET CLOSED</div>')
+    start_x = left(spot(E.STARTING_CASH))
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>{ARCADE_CSS}</style></head><body><div class="wrap">
+<div class="top"><div class="title">BOT TRADER '26</div>
+<div class="mid">DAY {max(1, day):02d} <span id="count" data-target="{target or ''}" data-label="{label}"></span></div>{sign}</div>
+<div class="key">FURTHER RIGHT = MORE MONEY &nbsp;&nbsp; CRATE = STOCKS OWNED &nbsp;&nbsp; IOU = SHORTS</div>
+<div class="track"><div class="start" style="left:{start_x}"></div>
+<div class="startlab" style="left:{start_x}">${E.STARTING_CASH:.0f} START</div><div class="flag"></div>
+{''.join(lanes)}</div>
+<div class="tick"><div id="tick"><span>{ticker}</span><span aria-hidden="true">{ticker}</span></div></div>
+</div><script>
+(function(){{
+  var t=document.getElementById('tick'); if(t) t.style.animationDelay='-'+((Date.now()/1000)%40)+'s';
+  var c=document.getElementById('count'); var target=Date.parse(c.dataset.target||'');
+  function show(){{ if(isNaN(target)) return; var s=Math.max(0,Math.floor((target-Date.now())/1000));
+    var p=function(n){{return (n<10?'0':'')+n}};
+    c.textContent='\\u00a0 '+c.dataset.label+' '+p(Math.floor(s/3600))+':'+p(Math.floor(s%3600/60))+':'+p(s%60); }}
+  show(); setInterval(show,1000);
+}})();
+</script></body></html>""", 118 + 88 * len(ranked) + 44
+
+
+# -----------------------------------------------------------------------------
 # Main page
 # -----------------------------------------------------------------------------
 def render():
@@ -256,7 +445,22 @@ def render():
                     "(it downloads the stock list and price history first).")
         return
 
+    page, height = arcade_html(state)
+    components.html(page, height=height, scrolling=False)
+    _, corner = st.columns([4, 1])
+    with corner:
+        details = st.toggle("▾ Full details", key="show_details",
+                            help="Show the leaderboard, chart, daily summaries and every bot's "
+                                 "positions and orders.")
     eng = state.get("engine", {})
+    if eng.get("throttled"):
+        st.warning(f"Yahoo is limiting how often prices can be downloaded, so prices currently "
+                   f"refresh every {eng.get('price_refresh_seconds', 0):.0f} seconds. "
+                   "The engine speeds back up by itself.")
+    if not details:
+        st.caption(f"Last saved {uk_time(eng.get('heartbeat_utc'), '%H:%M:%S')} UK. "
+                   "Switch on Full details for everything else.")
+        return
     market = E.market_status(E.utc_now())
     session = market.get("session", "?")
     badge = {"open": "🟢 OPEN", "pre-market": "🌅 PRE-MARKET", "after-hours": "🌙 AFTER HOURS",
@@ -267,11 +471,7 @@ def render():
     c3.metric("Stocks being tracked", eng.get("symbols_tracked", 0),
               f"of {eng.get('universe_size', 0):,} tradable", delta_color="off")
     c4.metric("Results as of (UK)", uk_time(eng.get("heartbeat_utc"), "%a %H:%M"))
-    if eng.get("throttled"):
-        st.warning(f"Yahoo is limiting how often prices can be downloaded, so prices currently "
-                   f"refresh every {eng.get('price_refresh_seconds', 0):.0f} seconds. "
-                   "The engine speeds back up by itself.")
-    elif eng.get("data_errors"):
+    if eng.get("data_errors") and not eng.get("throttled"):
         st.warning("Data problems on the last download: " + " | ".join(eng["data_errors"])[:500])
     st.caption(f"Stock list: {eng.get('universe_source', '-')}. Orders only fill while the US "
                "market is open (2:30pm–9pm UK time on normal days).")
@@ -331,6 +531,50 @@ def render():
         st.subheader("📈 Equity over time")
         st.altair_chart(chart, width="stretch")
 
+    # ---------------- daily summaries
+    days = state.get("daily_summaries", [])
+    if days:
+        st.subheader("🗓️ Daily summaries")
+        for i, day in enumerate(reversed(days[-30:])):
+            ranked = sorted(day["bots"].items(), key=lambda kv: -kv[1]["equity"])
+            label = datetime.strptime(day["date"], "%Y-%m-%d").strftime("%A %d %B")
+            winner = max(day["bots"].items(), key=lambda kv: kv[1]["day_change"])
+            title = (f"{label} · best day: {winner[0]} ({winner[1]['day_change']:+.2f}) · "
+                     f"leader: {ranked[0][0]} (${ranked[0][1]['equity']:.2f})")
+            with st.expander(title, expanded=(i == 0)):
+                if day.get("half_day"):
+                    st.caption("Half day: the market closed early.")
+                for place, (name, b) in enumerate(ranked, start=1):
+                    words = {"BUY": "buy", "SELL": "sell", "SHORT": "short", "COVER": "cover",
+                             "SPLIT": "split adjustment"}
+                    trades = ", ".join(f"{n} {words.get(a, a.lower())}{'s' if n != 1 and a != 'SPLIT' else ''}"
+                                       for a, n in b["orders"].items()) or "no trades"
+                    parts = [f"**{place}. {ICONS.get(name, '')} {name}: ${b['equity']:.2f}** "
+                             f"({b['day_change']:+.2f} today, {b['day_pct']:+.2f}%; "
+                             f"{b['total_pct']:+.2f}% overall).",
+                             f"Trades: {trades}" + (f" worth ${b['traded_value']:.2f}, fees ${b['fees']:.2f}."
+                                                    if b["orders"] else "."),
+                             f"Holding {b['open_positions']} positions "
+                             f"(${b['long']:.2f} long, ${b['short']:.2f} short, ${b['cash']:.2f} cash)."]
+                    if b["orders"] and b["realized"]:
+                        parts.append(f"Closed trades made {b['realized']:+.2f}.")
+                    if b.get("best"):
+                        parts.append(f"Best holding: {b['best']['symbol']} ({b['best']['pnl']:+.2f}).")
+                    if b.get("worst"):
+                        parts.append(f"Worst: {b['worst']['symbol']} ({b['worst']['pnl']:+.2f}).")
+                    flags = []
+                    if b["rejected"]:
+                        flags.append(f"{b['rejected']} orders rejected")
+                    if b["margin_calls"]:
+                        flags.append(f"{b['margin_calls']} positions closed by margin call")
+                    if b["error"]:
+                        flags.append("the bot reported an error")
+                    if not b["loaded"]:
+                        flags.append("the bot was not loaded")
+                    if flags:
+                        parts.append("⚠️ " + "; ".join(flags) + ".")
+                    st.markdown(" ".join(parts))
+
     # ---------------- per-bot desks
     st.subheader("🗂️ Bot desks")
     tabs = st.tabs([f"{ICONS.get(n, '')} {n}" for n in names])
@@ -383,7 +627,9 @@ def render():
                 st.markdown("**Order history** (newest first)")
                 ledger = state.get("ledgers", {}).get(name, [])
                 if ledger:
-                    ldf = pd.DataFrame(ledger[:300])
+                    ldf = pd.DataFrame(ledger[:300]).reindex(columns=[
+                        "time_utc", "status", "action", "symbol", "value", "price", "fee",
+                        "realized_pnl", "reason"])
                     ldf["Time (UK)"] = ldf["time_utc"].map(lambda t: uk_time(t, "%d %b %H:%M:%S"))
                     show = ldf[["Time (UK)", "status", "action", "symbol", "value", "price",
                                 "fee", "realized_pnl", "reason"]].rename(columns={
