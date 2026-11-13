@@ -661,6 +661,73 @@ def research(view, watch, positions):
             st.caption("⛔ = can't be traded here (an ETF or other non-stock, or under $1).")
 
 
+def stop_text(stop, side):
+    """One line describing a position's stop-loss / take-profit."""
+    if not stop:
+        return ""
+    parts = []
+    if stop.get("stop_price"):
+        parts.append(f"stop-loss at ${stop['stop_price']:.2f}")
+    if stop.get("trail_pct"):
+        best = stop.get("best")
+        if best:
+            level = best * (1 - stop["trail_pct"] / 100) if side == "LONG" else best * (1 + stop["trail_pct"] / 100)
+            parts.append(f"trailing stop {stop['trail_pct']:g}% (now ${level:.2f})")
+        else:
+            parts.append(f"trailing stop {stop['trail_pct']:g}%")
+    if stop.get("target_price"):
+        parts.append(f"take-profit at ${stop['target_price']:.2f}")
+    return " · ".join(parts)
+
+
+def stop_editor(positions, stops):
+    with st.expander("🛑 Set or change a stop-loss / take-profit"):
+        st.caption("Checked every engine cycle while the market is open (about every 20 seconds). "
+                   "When one is crossed, the whole position is closed at that cycle's price. "
+                   "If a stock jumps past your level, especially overnight, it closes at the "
+                   "next price, which can be worse than your level.")
+        sym = st.selectbox("Position", list(positions), key="stop_sym")
+        p = positions[sym]
+        price = p["price"]
+        long = p["side"] == "LONG"
+        st.write(f"{sym} is {p['side'].lower()} at {money(price)} now.")
+        kind = st.radio("Stop-loss type", ["None", "Fixed price", "Trailing %"], horizontal=True,
+                        key="stop_kind")
+        stop_price = trail_pct = None
+        if kind == "Fixed price":
+            default = round(price * (0.95 if long else 1.05), 2)
+            stop_price = st.number_input(
+                f"Close if the price {'falls to' if long else 'rises to'} ($)", min_value=0.01,
+                value=default, step=0.5, format="%.2f", key=f"stop_price_{sym}")
+        elif kind == "Trailing %":
+            trail_pct = st.number_input("Close if the price moves this % against its best since now",
+                                        min_value=0.5, max_value=50.0, value=5.0, step=0.5,
+                                        format="%.1f", key=f"trail_{sym}")
+        target = st.number_input(f"Take-profit: close if the price {'rises to' if long else 'falls to'} "
+                                 "($, 0 = none)", min_value=0.0, value=0.0, step=0.5,
+                                 format="%.2f", key=f"target_{sym}")
+        c1, c2 = st.columns(2)
+        if c1.button("Save", type="primary", key="stop_save", use_container_width=True):
+            problem = None
+            if stop_price and (stop_price >= price if long else stop_price <= price):
+                problem = (f"A stop-loss on a {'long' if long else 'short'} position must be "
+                           f"{'below' if long else 'above'} the current price ({money(price)}).")
+            elif target and (target <= price if long else target >= price):
+                problem = (f"A take-profit must be {'above' if long else 'below'} the current "
+                           f"price ({money(price)}).")
+            elif not (stop_price or trail_pct or target):
+                problem = "Choose a stop-loss or a take-profit (or use Remove)."
+            if problem:
+                st.error(problem)
+            else:
+                send_to_human({"type": "stop", "symbol": sym, "stop_price": stop_price,
+                               "trail_pct": trail_pct, "target_price": target or None})
+                st.success("Saved. It takes effect on the next engine cycle.")
+        if stops.get(sym) and c2.button("Remove", key="stop_clear", use_container_width=True):
+            send_to_human({"type": "clear_stop", "symbol": sym})
+            st.success(f"Stops on {sym} removed (on the next engine cycle).")
+
+
 def trading_desk():
     st.subheader(f"{ICONS.get(HUMAN, '')} Your trading desk")
     if MODE == "github":
@@ -708,6 +775,17 @@ def trading_desk():
         amount = st.number_input("Amount in dollars", min_value=1.0, value=10.0, step=1.0,
                                  format="%.2f")
         whole = st.checkbox("Whole position (for Sell or Cover)")
+        st.caption("Optional, for Buy or Short: protect the position as soon as it fills. "
+                   "Leave at 0 for none.")
+        c1, c2 = st.columns(2)
+        stop_pct = c1.number_input("Stop-loss %", min_value=0.0, max_value=50.0, value=0.0,
+                                   step=0.5, format="%.1f",
+                                   help="Closes the position if the price moves this far against "
+                                        "you from your fill price.")
+        target_pct = c2.number_input("Take-profit %", min_value=0.0, max_value=200.0, value=0.0,
+                                     step=0.5, format="%.1f",
+                                     help="Closes the position once it has made this much.")
+        trail = st.checkbox("Make the stop-loss trailing (it follows the price as it moves your way)")
         placed = st.form_submit_button("Place order", type="primary", use_container_width=True)
     if placed:
         sym = E.normalize_symbol(ticker)
@@ -740,8 +818,12 @@ def trading_desk():
             st.error(problem)
         else:
             amt = "ALL" if (whole and action in ("SELL", "COVER")) else round(float(amount), 2)
-            send_to_human({"type": "order", "id": uuid.uuid4().hex[:10], "symbol": sym,
-                           "action": action, "amount": amt, "placed_utc": E.iso(E.utc_now())})
+            message = {"type": "order", "id": uuid.uuid4().hex[:10], "symbol": sym,
+                       "action": action, "amount": amt, "placed_utc": E.iso(E.utc_now())}
+            if action in ("BUY", "SHORT"):
+                message.update(stop_pct=float(stop_pct), trail=bool(trail),
+                               target_pct=float(target_pct))
+            send_to_human(message)
             when = ("on the next engine cycle" if market["is_open"] else "at the next open")
             what = "the whole position" if amt == "ALL" else f"${amt:.2f}"
             st.success(f"Order sent: {verb.lower()} {what} of {sym}. It goes through {when}; "
@@ -753,24 +835,36 @@ def trading_desk():
         st.markdown("**Waiting to go through**")
         for o in pending:
             what = "whole position" if o["amount"] == "ALL" else f"${o['amount']:.2f}"
+            arm = o.get("arm") or {}
+            extra = []
+            if arm.get("stop_pct"):
+                extra.append(f"{'trailing ' if arm.get('trail') else ''}stop {arm['stop_pct']:g}%")
+            if arm.get("target_pct"):
+                extra.append(f"take-profit {arm['target_pct']:g}%")
             c1, c2 = st.columns([3, 1])
-            c1.write(f"{o['action'].title()} {o['symbol']} · {what}")
+            c1.write(f"{o['action'].title()} {o['symbol']} · {what}"
+                     + (f" · {', '.join(extra)}" if extra else ""))
             if c2.button("Cancel", key=f"cancel_{o['id']}"):
                 send_to_human({"type": "cancel", "id": o["id"]})
                 st.toast("Cancel sent. It takes effect on the next engine cycle.")
 
     # ---------------- positions
     st.markdown("**Your positions**")
+    stops = view.get("stops", {})
     if positions:
         for sym, p in positions.items():
             c1, c2 = st.columns([3, 1])
+            guard = stop_text(stops.get(sym), p["side"])
+            if not guard and sym in (view.get("arming") or {}):
+                guard = "protection being set up"
             c1.write(f"{sym} · {p['side'].lower()} · {money(abs(p['value']))} · "
-                     f"P&L {p['unrealized_pnl']:+.2f}")
+                     f"P&L {p['unrealized_pnl']:+.2f}" + (f"  \n🛑 {guard}" if guard else ""))
             if c2.button("Close", key=f"close_{sym}"):
                 send_to_human({"type": "order", "id": uuid.uuid4().hex[:10], "symbol": sym,
                                "action": "SELL" if p["side"] == "LONG" else "COVER",
                                "amount": "ALL", "placed_utc": E.iso(E.utc_now())})
                 st.toast(f"Closing {sym}: sent.")
+        stop_editor(positions, stops)
     else:
         st.caption("None yet.")
 
@@ -815,7 +909,10 @@ def trading_desk():
         st.markdown("**Recent results**")
         for r in results[:10]:
             when = uk_time(r.get("time_utc"), "%a %H:%M")
-            if r.get("status") == "FILLED":
+            if r.get("status") == "TRIGGERED":
+                st.write(f"🛑 {when} · {r.get('symbol')}: {r.get('reason')}. "
+                         "Closing the whole position.")
+            elif r.get("status") == "FILLED":
                 pnl = r.get("realized_pnl")
                 extra = "" if pnl is None else f", P&L {pnl:+.2f}"
                 st.write(f"✅ {when} · {str(r.get('action', '')).title()} {r.get('symbol')} "
