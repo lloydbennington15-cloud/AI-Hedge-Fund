@@ -525,6 +525,142 @@ def tradable_symbols():
     return cache.get("symbols") or {}
 
 
+def _pct(new, old):
+    return (new / old - 1) * 100 if new and old else None
+
+
+def research(view, watch, positions):
+    """Charts and figures for one stock, built only from the data the bots
+    receive: about six months of daily prices, today's minute-by-minute
+    prices, and the market movers lists."""
+    st.markdown("**📊 Research a stock**")
+    st.caption("This uses exactly the market data the bots get: about six months of daily "
+               "prices, today's minute-by-minute prices, and the market movers lists.")
+    history = (E.read_json(os.path.join(human_dir(), "daily.json")) or {}).get("daily", {})
+    intraday = view.get("intraday", {})
+    choices = list(dict.fromkeys(list(watch) + list(positions)))
+    if not choices:
+        st.caption("Add stocks to your watchlist (further down) to see their charts and figures.")
+    else:
+        names = {w["symbol"]: w.get("name", "") for w in watch.values()}
+        pick = st.selectbox("Stock", choices, key="research_pick",
+                            format_func=lambda x: f"{x} · {names.get(x, '')}"[:60])
+        span = st.radio("Chart", ["Today", "1 month", "3 months", "6 months"], index=2,
+                        horizontal=True, key="research_span")
+        rows = history.get(pick, [])
+        today = E.market_status(E.utc_now())["new_york_date"]
+        done = [r for r in rows if r[0] < today]
+        closes = [r[1] for r in done]
+        price = (watch.get(pick) or {}).get("price") or (positions.get(pick) or {}).get("price")
+        if not price and closes:
+            price = closes[-1]
+        if not rows and not intraday.get(pick):
+            st.info(f"No price history for {pick} yet. It arrives after the next engine cycle.")
+        else:
+            def back(days):
+                return closes[-1 - days] if len(closes) > days else None
+            avg50 = sum(closes[-50:]) / len(closes[-50:]) if len(closes) >= 50 else None
+            hi = max(closes) if closes else None
+            moves = [closes[i] / closes[i - 1] - 1 for i in range(max(1, len(closes) - 20), len(closes))]
+            daily_move = (sum(m * m for m in moves) / len(moves)) ** 0.5 * 100 if moves else None
+            traded = sorted(r[1] * r[2] for r in done[-20:])
+            traded = traded[len(traded) // 2] if traded else None
+
+            def fmt(v, kind="pct"):
+                if v is None:
+                    return "-"
+                return f"{v:+.2f}%" if kind == "pct" else f"${v:,.2f}"
+            cells = [("Price", fmt(price, "$")), ("Today", fmt(_pct(price, back(0)))),
+                     ("1 week", fmt(_pct(price, back(4)))), ("1 month", fmt(_pct(price, back(20)))),
+                     ("3 months", fmt(_pct(price, back(62)))),
+                     ("6 months", fmt(_pct(price, closes[0] if closes else None))),
+                     ("vs 6-month high", fmt(_pct(price, hi))),
+                     ("50-day average", fmt(avg50, "$"))]
+
+            def tint(text):
+                if text.startswith("+"):
+                    return "color:#16a34a"
+                if text.startswith("-") and text != "-":
+                    return "color:#dc2626"
+                return ""
+            grid = "".join(
+                f'<div style="padding:6px 8px;border:1px solid rgba(128,128,128,.25);border-radius:8px">'
+                f'<div style="font-size:.75rem;opacity:.7">{label}</div>'
+                f'<div style="font-size:1.05rem;font-weight:600;{tint(value)}">{value}</div></div>'
+                for label, value in cells)
+            st.markdown(f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));'
+                        f'gap:6px;margin-bottom:6px">{grid}</div>', unsafe_allow_html=True)
+            notes = []
+            if avg50:
+                side = "above" if price >= avg50 else "below"
+                notes.append(f"price is {side} its 50-day average")
+            if daily_move:
+                notes.append(f"typical daily move ±{daily_move:.1f}%")
+            if traded:
+                notes.append(f"about ${traded / 1e6:,.0f}m traded a day")
+            if notes:
+                st.caption(" · ".join(notes))
+
+            if span == "Today":
+                bars = intraday.get(pick, [])
+                cdf = pd.DataFrame(bars, columns=["t", "Price", "Volume"]) if bars else pd.DataFrame()
+                if not cdf.empty:
+                    cdf["Time"] = (pd.to_datetime(cdf["t"], utc=True).dt.tz_convert(UK)
+                                   .dt.tz_localize(None))
+                    line = alt.Chart(cdf).mark_line(color="#f472b6", strokeWidth=2).encode(
+                        x=alt.X("Time:T", title="UK time"),
+                        y=alt.Y("Price:Q", scale=alt.Scale(zero=False), title="Price ($)"),
+                        tooltip=[alt.Tooltip("Time:T", format="%H:%M"),
+                                 alt.Tooltip("Price:Q", format="$.2f")])
+                    st.altair_chart(line.properties(height=240), width="stretch")
+                else:
+                    st.caption("No trading yet today.")
+            else:
+                days = {"1 month": 21, "3 months": 63, "6 months": 200}[span]
+                ddf = pd.DataFrame(rows, columns=["Date", "Price", "Volume"])
+                ddf["50-day average"] = ddf["Price"].rolling(50).mean()
+                ddf = ddf.tail(days)
+                ddf["Date"] = pd.to_datetime(ddf["Date"])
+                melted = ddf.melt(id_vars="Date", value_vars=["Price", "50-day average"],
+                                  var_name="Line", value_name="Value").dropna()
+                chart = alt.Chart(melted).mark_line(strokeWidth=2).encode(
+                    x=alt.X("Date:T", title=None),
+                    y=alt.Y("Value:Q", scale=alt.Scale(zero=False), title="Price ($)"),
+                    color=alt.Color("Line:N", scale=alt.Scale(domain=["Price", "50-day average"],
+                                                              range=["#f472b6", "#94a3b8"]),
+                                    legend=alt.Legend(orient="bottom", title=None)),
+                    strokeDash=alt.StrokeDash("Line:N", scale=alt.Scale(
+                        domain=["Price", "50-day average"], range=[[1, 0], [5, 4]]), legend=None),
+                    tooltip=[alt.Tooltip("Date:T", format="%d %b"), "Line:N",
+                             alt.Tooltip("Value:Q", format="$.2f")])
+                st.altair_chart(chart.properties(height=240), width="stretch")
+
+    movers = view.get("movers") or {}
+    if movers:
+        with st.expander("🔥 Today's market movers (the same lists the bots get)"):
+            titles = {"day_gainers": "Biggest gainers", "day_losers": "Biggest losers",
+                      "most_actives": "Most traded", "small_cap_gainers": "Small-company gainers"}
+            pick_list = st.radio("List", [k for k in titles if movers.get(k)], horizontal=True,
+                                 format_func=lambda k: titles[k], key="movers_pick")
+            items = movers.get(pick_list, [])
+            mdf = pd.DataFrame([{"Stock": q.get("symbol"), "Change %": q.get("change_pct"),
+                                 "Price": q.get("price"), "Name": q.get("name", ""),
+                                 "Tradable": "✅" if q.get("tradable") else "⛔"} for q in items])
+            if not mdf.empty:
+                st.dataframe(mdf, hide_index=True, width="stretch", height=280,
+                             column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
+                                            "Change %": st.column_config.NumberColumn(format="%+.2f%%")})
+                ok = [q["symbol"] for q in items if q.get("tradable") and q["symbol"] not in watch]
+                if ok:
+                    c1, c2 = st.columns([3, 1])
+                    add = c1.selectbox("Add one to your watchlist", ok, key="mover_add",
+                                       label_visibility="collapsed")
+                    if c2.button("Watch", key="mover_watch"):
+                        send_to_human({"type": "watch", "symbol": add})
+                        st.toast(f"{add} added. Its chart appears after the next engine cycle.")
+            st.caption("⛔ = can't be traded here (an ETF or other non-stock, or under $1).")
+
+
 def trading_desk():
     st.subheader(f"{ICONS.get(HUMAN, '')} Your trading desk")
     if MODE == "github":
@@ -561,8 +697,10 @@ def trading_desk():
     if st.button("🔄 Refresh my desk", key="desk_refresh"):
         st.rerun()
 
-    # ---------------- place an order
     watch = {w["symbol"]: w for w in view.get("watch", [])}
+    research(view, watch, positions)
+
+    # ---------------- place an order
     with st.form("order_form", clear_on_submit=True):
         st.markdown("**Place an order**")
         ticker = st.text_input("Stock ticker", placeholder="e.g. AAPL")

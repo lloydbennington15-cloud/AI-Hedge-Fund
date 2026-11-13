@@ -18,7 +18,10 @@ How it works
     stock that isn't on the watchlist yet waits the one cycle it takes for its
     price to arrive.
   * It writes `view.json` every cycle: the account, the watchlist with prices,
-    waiting orders and recent results. The trading desk shows that file.
+    today's minute-by-minute prices, the market movers lists, waiting orders
+    and recent results. It writes `daily.json` (about six months of daily
+    prices) whenever that changes. The trading desk shows both files, so
+    Lloyd sees exactly the market data the bots receive, and nothing more.
 """
 
 import json
@@ -39,6 +42,7 @@ class LloydBot:
         self.status = "Waiting for Lloyd's orders"
         self._dir = None
         self._st = None
+        self._daily_sig = None
 
     # ------------------------------------------------------------------ engine
     def market_tick(self, data):
@@ -161,11 +165,21 @@ class LloydBot:
                           "change_pct": (price / prev - 1) * 100 if price and prev else None,
                           "on_watchlist": sym in self._st["watch"]})
         status = data.get("watchlist_status") or {}
+        intraday = {sym: [[b[0], b[4], b[5]] for b in bars]
+                    for sym, bars in (data.get("intraday_bars") or {}).items() if bars}
         view = {"updated_utc": now, "market": market, "account": data.get("account", {}),
                 "watch": watch, "watch_limit": self.WATCH_LIMIT,
                 "refused": status.get("rejected", {}),
-                "pending": self._st["pending"], "results": self._st["results"][:15]}
+                "pending": self._st["pending"], "results": self._st["results"][:15],
+                "intraday": intraday, "movers": data.get("movers") or {}}
         self._write("view.json", view)
+
+        history = {sym: [[b[0], b[4], b[5]] for b in bars]
+                   for sym, bars in daily.items() if bars}
+        signature = sorted((sym, len(rows), rows[-1][0]) for sym, rows in history.items())
+        if signature != self._daily_sig:
+            self._daily_sig = signature
+            self._write("daily.json", {"updated_utc": now, "daily": history})
 
     # ------------------------------------------------------------------ saving
     def _load(self, storage_dir):
