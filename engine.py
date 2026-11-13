@@ -20,7 +20,8 @@ Every cycle it:
   6. saves everything to tournament_state.json, which the dashboard reads.
 
 Bots live in gemini_bot.py, claude_bot.py, chatgpt_bot.py, grok_bot.py and
-fable_bot.py in this folder. If a bot file is replaced, the engine notices
+fable_bot.py in this folder. lloyd_bot.py is the human player: it makes no
+decisions and passes on the orders Lloyd places from the dashboard. If a bot file is replaced, the engine notices
 within a minute and loads the new version; the bot's account and positions
 carry on.
 
@@ -78,7 +79,9 @@ BOTS = [
     ("ChatGPT", "chatgpt_bot", "ChatGPTBot"),
     ("Grok", "grok_bot", "GrokBot"),
     ("Fable", "fable_bot", "FableBot"),
+    ("Lloyd", "lloyd_bot", "LloydBot"),     # the human player: trades from the dashboard
 ]
+HUMAN_PLAYER = "Lloyd"                       # the contestant whose orders come from the dashboard
 
 STARTING_CASH = 100.0          # US dollars per bot
 FEE_RATE = 0.001               # 0.1% of the value of every order

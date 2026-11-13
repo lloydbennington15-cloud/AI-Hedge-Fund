@@ -49,15 +49,26 @@ DEFAULT_GITHUB_REPO = "lloydbennington15-cloud/AI-Hedge-Fund"
 DATA_BRANCH = "tournament-data"
 
 COLORS = {"Gemini": "#10b981", "Claude": "#a855f7", "ChatGPT": "#f97316",
-          "Grok": "#6b7280", "Fable": "#3b82f6"}
-ICONS = {"Gemini": "🤖", "Claude": "🟪", "ChatGPT": "🟠", "Grok": "⚫", "Fable": "🔷"}
+          "Grok": "#6b7280", "Fable": "#3b82f6", "Lloyd": "#f472b6"}
+ICONS = {"Gemini": "🤖", "Claude": "🟪", "ChatGPT": "🟠", "Grok": "⚫", "Fable": "🔷",
+         "Lloyd": "🕹️"}
+HUMAN = getattr(E, "HUMAN_PLAYER", None)
 SPARE_COLORS = ["#ef4444", "#eab308", "#14b8a6", "#ec4899"]
 BOT_NAMES = [b[0] for b in E.BOTS]
 for _i, _name in enumerate(n for n in BOT_NAMES if n not in COLORS):
     COLORS[_name] = SPARE_COLORS[_i % len(SPARE_COLORS)]
 
 st.set_page_config(page_title="AI Trading Tournament", page_icon="🏛️",
-                   layout="wide", initial_sidebar_state="expanded")
+                   layout="wide", initial_sidebar_state="auto")
+st.markdown("""<style>
+@media (max-width: 640px) {
+  [data-testid="stMainBlockContainer"], .block-container {
+    padding-left: 0.7rem !important; padding-right: 0.7rem !important; padding-top: 2.6rem !important; }
+  h1 { font-size: 1.55rem !important; }
+  h2, h3 { font-size: 1.2rem !important; }
+  [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
+}
+</style>""", unsafe_allow_html=True)
 
 
 def github_repo():
@@ -170,18 +181,23 @@ def github_sidebar():
         st.rerun()
 
 
-def controls_unlocked():
+def is_unlocked():
+    return not os.environ.get("TOURNAMENT_PASSWORD", "") or bool(st.session_state.get("unlocked"))
+
+
+def controls_unlocked(where=None, key="pw_sidebar"):
     """Anyone can view the page. If TOURNAMENT_PASSWORD is set on the server,
-    the controls (start, pause, reload, reset) need that password."""
-    password = os.environ.get("TOURNAMENT_PASSWORD", "")
-    if not password or st.session_state.get("unlocked"):
+    the controls (start, pause, reload, reset) and trading need that password."""
+    if is_unlocked():
         return True
-    entered = st.sidebar.text_input("🔒 Password to unlock the controls", type="password")
+    where = where or st.sidebar
+    password = os.environ.get("TOURNAMENT_PASSWORD", "")
+    entered = where.text_input("🔒 Password to unlock the controls", type="password", key=key)
     if entered and hmac.compare_digest(entered.encode(), password.encode()):
         st.session_state["unlocked"] = True
         st.rerun()
     if entered:
-        st.sidebar.error("Wrong password")
+        where.error("Wrong password")
     return False
 
 
@@ -248,11 +264,12 @@ ARCADE_CSS = """
 body{margin:0;background:#05050f;color:#fff;font-family:'Press Start 2P',ui-monospace,Menlo,Consolas,monospace}
 @keyframes step{0%,49%{transform:translateY(0)}50%,100%{transform:translateY(-3px)}}
 @keyframes jog{0%,100%{transform:translateX(0)}50%{transform:translateX(6px)}}
+@keyframes climb{0%,49%{transform:translateY(0) scale(.8)}50%,100%{transform:translateY(-5px) scale(.8)}}
 @keyframes blink{0%,60%{opacity:1}61%,100%{opacity:0}}
 @keyframes snooze{0%{transform:translate(0,0);opacity:0}30%{opacity:1}100%{transform:translate(10px,-20px);opacity:0}}
 @keyframes ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-.wrap{position:relative;min-width:680px;padding:16px 22px 44px 22px;overflow:hidden}
-.top{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.wrap{position:relative;height:100vh;padding:16px 22px 44px 22px;overflow:hidden}
+.top{display:flex;justify-content:space-between;align-items:center;gap:6px 12px;flex-wrap:wrap}
 .title{font-size:16px;color:#facc15}
 .mid{font-size:9px;color:#cbd5e1}
 .sign{font-size:11px}
@@ -286,8 +303,34 @@ body{margin:0;background:#05050f;color:#fff;font-family:'Press Start 2P',ui-mono
 .tick{position:absolute;left:0;right:0;bottom:0;height:34px;overflow:hidden;background:#111827;border-top:3px solid #facc15}
 .tick div{display:flex;width:max-content;font-size:9px;line-height:31px;color:#fde68a;animation:ticker 40s linear infinite}
 .tick span{padding-right:48px;white-space:nowrap}
+.tall{display:none}
+.tower{position:relative;margin-top:10px}
+.finish{position:absolute;left:0;right:0;top:0;height:12px;background-image:repeating-conic-gradient(#fff 0 25%,#05050f 0 50%);background-size:12px 12px}
+.ground{position:absolute;left:0;right:0;bottom:30px;height:10px;background:repeating-linear-gradient(90deg,#e11d48 0 18px,#fb7185 18px 21px);border-top:2px solid #fda4af;border-bottom:2px solid #9f1239}
+.tstart{position:absolute;left:0;right:0;height:0;border-top:2px dashed #22d3ee}
+.tstartlab{position:absolute;left:0;font-size:6px;color:#22d3ee;background:#05050f;padding:0 2px;transform:translateY(-110%)}
+.col{position:absolute;top:0;bottom:0}
+.ladder{position:absolute;left:50%;margin-left:-12px;width:24px;top:14px;bottom:40px;background:repeating-linear-gradient(180deg,transparent 0 9px,#22d3ee 9px 12px);border-left:3px solid #22d3ee;border-right:3px solid #22d3ee;opacity:.75}
+.tbot{position:absolute;left:50%;margin-left:-15px;width:30px;height:38px;transform-origin:bottom center;transform:scale(.8);animation:climb 1.2s steps(1) infinite}
+.tbot.busy{animation-duration:.5s}.tbot.calm{animation-duration:1.6s}
+.tbot.asleep{animation:none}
+.tbot .zed{left:24px}
+.cname{position:absolute;left:0;right:0;bottom:12px;text-align:center;font-size:7px;line-height:9px;white-space:nowrap;overflow:hidden;filter:brightness(1.3)}
+.ccrate{position:absolute;left:0;right:0;bottom:0;text-align:center;font-size:6px;line-height:9px;color:#fde68a;white-space:nowrap;overflow:hidden}
+.rows{margin-top:10px}
+.row{padding:4px 0;border-bottom:1px solid #1e293b}
+.rtop{display:flex;justify-content:space-between;gap:8px;font-size:9px;line-height:13px}
+.rname{filter:brightness(1.3);white-space:nowrap}
+.rdoing{font-size:7px;line-height:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;filter:brightness(1.45)}
+@media (max-width: 640px){
+  .wide{display:none}
+  .tall{display:block}
+  .wrap{padding:10px 10px 40px 10px}
+  .title{font-size:12px}
+  .sign{font-size:9px}
+  .mid{font-size:8px;order:3;width:100%}
+}
 """
-
 
 def _arcade_activity(name, summary, bot, ledger, positions, market_open, now):
     """One line saying what the bot is doing, plus its mood (busy/calm/asleep)."""
@@ -339,10 +382,14 @@ def _arcade_activity(name, summary, bot, ledger, positions, market_open, now):
 
 
 def arcade_html(state):
+    """The animated race. Wide screens: bots run left to right along girders.
+    Phones (under 640px wide): bots climb ladders, with a list of what each
+    one is doing underneath. Both use the same data."""
     summary = state["summary"]
     now = E.utc_now()
     market = E.market_status(now)
     ranked = sorted(summary.items(), key=lambda kv: -kv[1]["equity"])
+    n = len(ranked)
     equities = [s["equity"] for _, s in ranked] + [E.STARTING_CASH]
     low, high = min(equities), max(equities)
     if high - low < 0.5:                                  # zoom in when they're pennies apart
@@ -357,9 +404,15 @@ def arcade_html(state):
     def left(fraction, offset=0):
         return f"calc(200px + (100% - 330px) * {fraction:.4f} + {offset}px)"
 
-    lanes = []
+    height = 118 + 88 * n + 44                            # the iframe's height (wide layout)
+    tall_fixed = 10 + 50 + 26 + 10 + 10 + 31 * n + 40     # everything on a phone except the tower
+    tower = max(240, height - tall_fixed)
+    climb_room = tower - 14 - 40 - 31                     # finish band, names, bot height
+
+    lanes, cols, rows = [], [], []
     for place, (name, s) in enumerate(ranked, start=1):
         color = "#9ca3af" if name == "Grok" else COLORS.get(name, "#e5e7eb")   # grey needs lifting on black
+        label = html.escape(name.upper())
         positions = state.get("positions", {}).get(name, [])
         text, mood, alert = _arcade_activity(name, s, state.get("bots", {}).get(name, {}),
                                              state.get("ledgers", {}).get(name, []), positions,
@@ -369,17 +422,29 @@ def arcade_html(state):
         crates = (f'<div class="crate">x{longs}</div>' if longs else "") + \
                  (f'<div class="crate iou">IOU x{shorts}</div>' if shorts else "")
         down = " down" if s["return_pct"] < 0 else ""
+        sprite = ('<div class="head"><div class="eye" style="left:4px"></div><div class="eye" style="left:14px"></div></div>'
+                  '<div class="body"></div><div class="leg" style="left:4px"></div>'
+                  '<div class="leg" style="left:18px;animation-delay:.2s"></div>'
+                  + ('<div class="zed">Z</div>' if mood == "asleep" else ""))
+        doing = f'<div class="doing{" alert" if alert else ""}" style="color:{color}">{html.escape(text)}</div>'
         lanes.append(
-            f'<div class="lane"><div class="who" style="color:{color}">{place} {html.escape(name.upper())}'
+            f'<div class="lane"><div class="who" style="color:{color}">{place} {label}'
             f'<div class="money{down}">${s["equity"]:.2f} {s["return_pct"]:+.2f}%</div></div>'
             f'<div class="girder"></div>'
-            f'<div class="bot {mood}" style="left:{left(spot(s["equity"]), -15)};color:{color}">'
-            f'<div class="head"><div class="eye" style="left:4px"></div><div class="eye" style="left:14px"></div></div>'
-            f'<div class="body"></div><div class="leg" style="left:4px"></div>'
-            f'<div class="leg" style="left:18px;animation-delay:.2s"></div>'
-            + ('<div class="zed">Z</div>' if mood == "asleep" else "")
+            f'<div class="bot {mood}" style="left:{left(spot(s["equity"]), -15)};color:{color}">{sprite}'
             + (f'<div class="crates" style="left:{46 if mood == "asleep" else 34}px">{crates}</div>' if crates else "")
-            + f'</div><div class="doing{" alert" if alert else ""}" style="color:{color}">{html.escape(text)}</div></div>')
+            + f'</div>{doing}</div>')
+        tags = " ".join(t for t in (f"x{longs}" if longs else "", f"IOU{shorts}" if shorts else "") if t)
+        cols.append(
+            f'<div class="col" style="left:{(place - 1) / n * 100:.3f}%;width:{100 / n:.3f}%">'
+            f'<div class="ladder"></div>'
+            f'<div class="tbot {mood}" style="bottom:{40 + climb_room * spot(s["equity"]):.0f}px;color:{color}">{sprite}</div>'
+            f'<div class="cname" style="color:{color}">{label}</div>'
+            f'<div class="ccrate">{tags or "CASH"}</div></div>')
+        rows.append(
+            f'<div class="row"><div class="rtop"><span class="rname" style="color:{color}">{place} {label}</span>'
+            f'<span class="money{down}">${s["equity"]:.2f} {s["return_pct"]:+.2f}%</span></div>'
+            f'<div class="rdoing{" alert" if alert else ""}" style="color:{color}">{html.escape(text)}</div></div>')
 
     fills = []
     for name, ledger in state.get("ledgers", {}).items():
@@ -393,7 +458,7 @@ def arcade_html(state):
         pnl = row.get("realized_pnl")
         tail = f"${row.get('value') or 0:.2f}" if pnl is None else f"{'+' if pnl >= 0 else '-'}${abs(pnl):.2f}"
         items.append(f"{name.upper()} {words[row['action']]} {row.get('symbol', '')} {tail}")
-    if len(ranked) > 1:
+    if n > 1:
         items.append(f"GAP FIRST TO LAST ${ranked[0][1]['equity'] - ranked[-1][1]['equity']:.2f}")
     ticker = html.escape("LATEST: " + "  *  ".join(items)) if items else "NO TRADES YET"
 
@@ -405,15 +470,24 @@ def arcade_html(state):
     sign = ('<div class="sign open">MARKET OPEN</div>' if market["is_open"]
             else '<div class="sign shut">MARKET CLOSED</div>')
     start_x = left(spot(E.STARTING_CASH))
+    start_y = 40 + climb_room * spot(E.STARTING_CASH)
     return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
 <style>{ARCADE_CSS}</style></head><body><div class="wrap">
 <div class="top"><div class="title">BOT TRADER '26</div>
 <div class="mid">DAY {max(1, day):02d} <span id="count" data-target="{target or ''}" data-label="{label}"></span></div>{sign}</div>
+<div class="wide">
 <div class="key">FURTHER RIGHT = MORE MONEY &nbsp;&nbsp; CRATE = STOCKS OWNED &nbsp;&nbsp; IOU = SHORTS</div>
 <div class="track"><div class="start" style="left:{start_x}"></div>
 <div class="startlab" style="left:{start_x}">${E.STARTING_CASH:.0f} START</div><div class="flag"></div>
-{''.join(lanes)}</div>
+{''.join(lanes)}</div></div>
+<div class="tall">
+<div class="key">HIGHER = MORE MONEY<br>x5 = 5 STOCKS OWNED &nbsp; IOU3 = 3 SHORTS</div>
+<div class="tower" style="height:{tower}px"><div class="finish"></div><div class="ground"></div>
+<div class="tstart" style="bottom:{start_y:.0f}px"><span class="tstartlab">${E.STARTING_CASH:.0f}</span></div>
+{''.join(cols)}</div>
+<div class="rows">{''.join(rows)}</div></div>
 <div class="tick"><div id="tick"><span>{ticker}</span><span aria-hidden="true">{ticker}</span></div></div>
 </div><script>
 (function(){{
@@ -424,43 +498,214 @@ def arcade_html(state):
     c.textContent='\\u00a0 '+c.dataset.label+' '+p(Math.floor(s/3600))+':'+p(Math.floor(s%3600/60))+':'+p(s%60); }}
   show(); setInterval(show,1000);
 }})();
-</script></body></html>""", 118 + 88 * len(ranked) + 44
+</script></body></html>""", height
+
+
+# -----------------------------------------------------------------------------
+# Lloyd's trading desk
+# -----------------------------------------------------------------------------
+ACTION_WORDS = {"Buy": "BUY", "Sell": "SELL", "Short": "SHORT", "Cover": "COVER"}
+
+
+def human_dir():
+    return os.path.join(E.BOT_DATA_DIR, HUMAN)
+
+
+def send_to_human(message):
+    """Drop one instruction in the human player's inbox. The engine picks it
+    up on its next cycle (within about 20 seconds while the market is open)."""
+    inbox = os.path.join(human_dir(), "inbox")
+    os.makedirs(inbox, exist_ok=True)
+    name = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}.json"
+    E.atomic_write_json(os.path.join(inbox, name), message)
+
+
+def tradable_symbols():
+    cache = E.read_json(E.UNIVERSE_CACHE) or {}
+    return cache.get("symbols") or {}
+
+
+def trading_desk():
+    st.subheader(f"{ICONS.get(HUMAN, '')} Your trading desk")
+    if MODE == "github":
+        st.info("Trading works when the engine runs on your own server.")
+        return
+    if not controls_unlocked(st, key="pw_desk"):
+        st.caption("Enter the dashboard password to trade.")
+        return
+    view = E.read_json(os.path.join(human_dir(), "view.json"))
+    if not view:
+        st.info(f"Your account appears here once the engine has loaded lloyd_bot.py. That happens "
+                "within a minute of uploading it, then takes one more engine cycle.")
+        return
+    updated = E.parse_iso(view.get("updated_utc"))
+    age = (E.utc_now() - updated).total_seconds() if updated else None
+    if age is not None and age > 300:
+        st.warning(f"Your account was last updated {age / 60:.0f} minutes ago. "
+                   "Check the engine is running (sidebar).")
+
+    acct = view.get("account", {})
+    positions = acct.get("positions", {})
+    market = E.market_status(E.utc_now())
+    m1, m2 = st.columns(2)
+    m1.metric("Your equity", money(acct.get("equity")),
+              f"{(acct.get('equity', E.STARTING_CASH) / E.STARTING_CASH - 1) * 100:+.2f}%")
+    m2.metric("Cash", money(acct.get("cash")))
+    st.caption(f"You can buy up to **{money(acct.get('max_new_buy'))}** and short up to "
+               f"**{money(acct.get('max_new_short'))}** right now. Fee: 0.1% of each order.")
+    if market["is_open"]:
+        st.success("Market open. Orders go through on the next engine cycle, within about 20 seconds.")
+    else:
+        st.info("Market closed. Orders you place now wait, and go through at the next open "
+                "(2:30pm UK on normal days).")
+    if st.button("🔄 Refresh my desk", key="desk_refresh"):
+        st.rerun()
+
+    # ---------------- place an order
+    watch = {w["symbol"]: w for w in view.get("watch", [])}
+    with st.form("order_form", clear_on_submit=True):
+        st.markdown("**Place an order**")
+        ticker = st.text_input("Stock ticker", placeholder="e.g. AAPL")
+        verb = st.radio("Action", list(ACTION_WORDS), horizontal=True)
+        amount = st.number_input("Amount in dollars", min_value=1.0, value=10.0, step=1.0,
+                                 format="%.2f")
+        whole = st.checkbox("Whole position (for Sell or Cover)")
+        placed = st.form_submit_button("Place order", type="primary", use_container_width=True)
+    if placed:
+        sym = E.normalize_symbol(ticker)
+        action = ACTION_WORDS[verb]
+        held = positions.get(sym)
+        universe = tradable_symbols()
+        price = (watch.get(sym) or {}).get("price") or (held or {}).get("price")
+        problem = None
+        if not E.SYMBOL_RE.match(sym or ""):
+            problem = "Type a ticker, for example AAPL or BRK-B."
+        elif universe and sym not in universe and not held:
+            problem = f"{sym} isn't on the US stock lists (or it's an ETF, warrant or unit, which aren't allowed)."
+        elif action == "BUY" and held and held["side"] == "SHORT":
+            problem = f"You're short {sym}. Cover it before buying."
+        elif action == "SHORT" and held and held["side"] == "LONG":
+            problem = f"You own {sym}. Sell it before shorting."
+        elif action == "SELL" and not (held and held["side"] == "LONG"):
+            problem = f"You don't own {sym}."
+        elif action == "COVER" and not (held and held["side"] == "SHORT"):
+            problem = f"You're not short {sym}."
+        elif action == "BUY" and amount > (acct.get("max_new_buy") or 0) + 1e-9:
+            problem = f"Too large. The most you can buy right now is {money(acct.get('max_new_buy'))}."
+        elif action == "SHORT" and amount > (acct.get("max_new_short") or 0) + 1e-9:
+            problem = f"Too large. The most you can short right now is {money(acct.get('max_new_short'))}."
+        elif action == "SHORT" and price and price < E.MIN_SHORT_PRICE:
+            problem = f"Stocks under ${E.MIN_SHORT_PRICE:.0f} can't be shorted."
+        elif action in ("BUY", "SHORT") and price and price < E.MIN_PRICE:
+            problem = f"Stocks under ${E.MIN_PRICE:.0f} can't be traded."
+        if problem:
+            st.error(problem)
+        else:
+            amt = "ALL" if (whole and action in ("SELL", "COVER")) else round(float(amount), 2)
+            send_to_human({"type": "order", "id": uuid.uuid4().hex[:10], "symbol": sym,
+                           "action": action, "amount": amt, "placed_utc": E.iso(E.utc_now())})
+            when = ("on the next engine cycle" if market["is_open"] else "at the next open")
+            what = "the whole position" if amt == "ALL" else f"${amt:.2f}"
+            st.success(f"Order sent: {verb.lower()} {what} of {sym}. It goes through {when}; "
+                       "the result appears under Recent results and in your desk below.")
+
+    # ---------------- waiting orders
+    pending = view.get("pending", [])
+    if pending:
+        st.markdown("**Waiting to go through**")
+        for o in pending:
+            what = "whole position" if o["amount"] == "ALL" else f"${o['amount']:.2f}"
+            c1, c2 = st.columns([3, 1])
+            c1.write(f"{o['action'].title()} {o['symbol']} · {what}")
+            if c2.button("Cancel", key=f"cancel_{o['id']}"):
+                send_to_human({"type": "cancel", "id": o["id"]})
+                st.toast("Cancel sent. It takes effect on the next engine cycle.")
+
+    # ---------------- positions
+    st.markdown("**Your positions**")
+    if positions:
+        for sym, p in positions.items():
+            c1, c2 = st.columns([3, 1])
+            c1.write(f"{sym} · {p['side'].lower()} · {money(abs(p['value']))} · "
+                     f"P&L {p['unrealized_pnl']:+.2f}")
+            if c2.button("Close", key=f"close_{sym}"):
+                send_to_human({"type": "order", "id": uuid.uuid4().hex[:10], "symbol": sym,
+                               "action": "SELL" if p["side"] == "LONG" else "COVER",
+                               "amount": "ALL", "placed_utc": E.iso(E.utc_now())})
+                st.toast(f"Closing {sym}: sent.")
+    else:
+        st.caption("None yet.")
+
+    # ---------------- watchlist
+    st.markdown(f"**Your watchlist** (prices update every cycle while the market is open)")
+    rows = [w for w in view.get("watch", []) if w.get("on_watchlist") or w["symbol"] in positions]
+    if rows:
+        wdf = pd.DataFrame([{"Stock": w["symbol"], "Price": w.get("price"),
+                             "Today %": w.get("change_pct"), "Name": w.get("name", "")}
+                            for w in rows])
+        st.dataframe(wdf, hide_index=True, width="stretch",
+                     column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Today %": st.column_config.NumberColumn(format="%+.2f%%")})
+    else:
+        st.caption("Empty. Add stocks to see their prices.")
+    with st.form("watch_form", clear_on_submit=True):
+        new = st.text_input("Add a stock to your watchlist", placeholder="e.g. NVDA")
+        if st.form_submit_button("Add", use_container_width=True):
+            sym = E.normalize_symbol(new)
+            universe = tradable_symbols()
+            if not E.SYMBOL_RE.match(sym or ""):
+                st.error("Type a ticker, for example NVDA.")
+            elif universe and sym not in universe:
+                st.error(f"{sym} isn't on the US stock lists.")
+            else:
+                send_to_human({"type": "watch", "symbol": sym})
+                st.success(f"{sym} added. Its price appears after the next engine cycle.")
+    mine = [w["symbol"] for w in view.get("watch", []) if w.get("on_watchlist")]
+    if mine:
+        c1, c2 = st.columns([3, 1])
+        drop = c1.selectbox("Remove a stock", mine, label_visibility="collapsed")
+        if c2.button("Remove", key="unwatch"):
+            send_to_human({"type": "unwatch", "symbol": drop})
+            st.toast(f"{drop} removed.")
+    if view.get("refused"):
+        st.caption("Refused by the engine: " + "; ".join(f"{k} ({v})" for k, v in
+                                                       list(view["refused"].items())[:5]))
+
+    # ---------------- recent results
+    results = view.get("results", [])
+    if results:
+        st.markdown("**Recent results**")
+        for r in results[:10]:
+            when = uk_time(r.get("time_utc"), "%a %H:%M")
+            if r.get("status") == "FILLED":
+                pnl = r.get("realized_pnl")
+                extra = "" if pnl is None else f", P&L {pnl:+.2f}"
+                st.write(f"✅ {when} · {str(r.get('action', '')).title()} {r.get('symbol')} "
+                         f"{money(r.get('value'))} at {money(r.get('price'))}{extra}")
+            else:
+                st.write(f"❌ {when} · {str(r.get('action', '')).title()} {r.get('symbol')}: "
+                         f"{r.get('reason')}")
 
 
 # -----------------------------------------------------------------------------
 # Main page
 # -----------------------------------------------------------------------------
-def render():
-    state, problem = load_state()
-    st.title("🏛️ AI Trading Tournament")
+def render_arcade():
+    state, _ = load_state()
     if not state or not state.get("summary"):
-        if MODE == "github":
-            st.info("No results have been published yet. After the first engine run finishes its "
-                    "first few minutes, they appear here automatically (GitHub can take up to "
-                    "5 minutes to show new data).")
-            if problem and "404" not in problem:
-                st.caption(f"Could not read the data: {problem}")
-        else:
-            st.info("Waiting for the engine's first cycle. This can take a minute after it starts "
-                    "(it downloads the stock list and price history first).")
         return
-
     page, height = arcade_html(state)
-    components.html(page, height=height, scrolling=False)
-    _, corner = st.columns([4, 1])
-    with corner:
-        details = st.toggle("▾ Full details", key="show_details",
-                            help="Show the leaderboard, chart, daily summaries and every bot's "
-                                 "positions and orders.")
-    eng = state.get("engine", {})
-    if eng.get("throttled"):
-        st.warning(f"Yahoo is limiting how often prices can be downloaded, so prices currently "
-                   f"refresh every {eng.get('price_refresh_seconds', 0):.0f} seconds. "
-                   "The engine speeds back up by itself.")
-    if not details:
-        st.caption(f"Last saved {uk_time(eng.get('heartbeat_utc'), '%H:%M:%S')} UK. "
-                   "Switch on Full details for everything else.")
+    if hasattr(st, "iframe"):                     # Streamlit 1.5x+: the supported way
+        st.iframe(page, height=height)
+    else:                                         # older Streamlit versions
+        components.html(page, height=height, scrolling=False)
+
+
+def render_details():
+    state, _ = load_state()
+    if not state or not state.get("summary"):
         return
+    eng = state.get("engine", {})
     market = E.market_status(E.utc_now())
     session = market.get("session", "?")
     badge = {"open": "🟢 OPEN", "pre-market": "🌅 PRE-MARKET", "after-hours": "🌙 AFTER HOURS",
@@ -525,7 +770,8 @@ def render():
             x=alt.X("Time:T", title="UK time"),
             y=alt.Y("Equity ($):Q", scale=alt.Scale(zero=False)),
             color=alt.Color("Bot:N", scale=alt.Scale(domain=shown,
-                                                     range=[COLORS.get(n, "#888888") for n in shown])),
+                                                     range=[COLORS.get(n, "#888888") for n in shown]),
+                            legend=alt.Legend(orient="bottom", columns=3, title=None)),
             tooltip=["Time:T", "Bot:N", alt.Tooltip("Equity ($):Q", format="$.2f")],
         ).properties(height=320)
         st.subheader("📈 Equity over time")
@@ -648,7 +894,56 @@ def render():
                + (f" · reading from github.com/{REPO}" if MODE == "github" else ""))
 
 
-if auto and hasattr(st, "fragment"):
-    st.fragment(run_every=60 if MODE == "github" else 15)(render)()
-else:
-    render()
+
+
+def main():
+    state, problem = load_state()
+    st.title("🏛️ AI Trading Tournament")
+    if not state or not state.get("summary"):
+        if MODE == "github":
+            st.info("No results have been published yet. After the first engine run finishes its "
+                    "first few minutes, they appear here automatically (GitHub can take up to "
+                    "5 minutes to show new data).")
+            if problem and "404" not in problem:
+                st.caption(f"Could not read the data: {problem}")
+        else:
+            st.info("Waiting for the engine's first cycle. This can take a minute after it starts "
+                    "(it downloads the stock list and price history first).")
+        return
+
+    refresh = (60 if MODE == "github" else 15) if (auto and hasattr(st, "fragment")) else None
+    if refresh:
+        st.fragment(run_every=refresh)(render_arcade)()
+    else:
+        render_arcade()
+
+    can_trade = bool(HUMAN) and MODE == "local"
+    if can_trade:
+        c1, c2 = st.columns(2)
+        trade = c1.toggle("🕹️ My trading desk", key="show_desk")
+        details = c2.toggle("▾ Full details", key="show_details",
+                            help="Show the leaderboard, chart, daily summaries and every bot's "
+                                 "positions and orders.")
+    else:
+        trade = False
+        details = st.toggle("▾ Full details", key="show_details",
+                            help="Show the leaderboard, chart, daily summaries and every bot's "
+                                 "positions and orders.")
+    eng = state.get("engine", {})
+    if eng.get("throttled"):
+        st.warning(f"Yahoo is limiting how often prices can be downloaded, so prices currently "
+                   f"refresh every {eng.get('price_refresh_seconds', 0):.0f} seconds. "
+                   "The engine speeds back up by itself.")
+    if trade:
+        trading_desk()
+    if details:
+        if refresh:
+            st.fragment(run_every=refresh)(render_details)()
+        else:
+            render_details()
+    elif not trade:
+        st.caption(f"Last saved {uk_time(eng.get('heartbeat_utc'), '%H:%M:%S')} UK. "
+                   "Switch on Full details for everything else.")
+
+
+main()
