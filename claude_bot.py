@@ -1,6 +1,6 @@
 """
-ClaudeBot (Opus) - version 2: researched, diversified trend portfolio
-=====================================================================
+ClaudeBot (Opus) - version 2: diversified trend portfolio
+=========================================================
 
 What changed at the halfway point, and why
 ------------------------------------------
@@ -24,33 +24,22 @@ fixes those weaknesses:
   3. BUY STRENGTH ON A DIP: among strong six-month trends, it prefers stocks
      that pulled back over the last week - a well-documented short-term
      effect that also avoids buying right after a spike.
-  4. READS THE NEWS (allowed from the halfway point): a quick, time-limited
-     lookup of each candidate's and holding's next results date and recent
-     headlines on Yahoo Finance. It won't buy within 5 trading days of a
-     results announcement, sells a holding before its results, skips stocks
-     with alarming headlines (investigations, lawsuits, downgrades, failed
-     trials...) or an unusual burst of news, and leaves a holding if two or
-     more such headlines appear.
-  5. MORE INVESTED, FEWER SWAPS: 7 stocks at 85% in a neutral market (8 at
+  4. MORE INVESTED, FEWER SWAPS: 7 stocks at 85% in a neutral market (8 at
      97% in a strong one); holdings stay while still in the top 60 and at
      least two days old.
-  6. DECIDES ONCE A DAY, LATE: 35 minutes before the close, when the day's
-     news is known. Stop-losses still run all session.
+  5. DECIDES ONCE A DAY, LATE: 35 minutes before the close, using the
+     day's price action. Stop-losses still run all session.
 
 In a falling market ("bear": under 35% of stocks in uptrends and the big
 stocks down over a month) it holds 3 strong stocks and shorts 4 weak ones.
 
-News lookups run in a separate, short-lived process with a hard 4-second
-limit, so a slow reply from Yahoo can never hold up the engine or the other
-bots. If Yahoo doesn't answer, the bot carries on without news.
+It uses only the market data the engine provides to every bot.
 """
 
 import hashlib
 import json
 import math
 import os
-import subprocess
-import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -79,49 +68,6 @@ SEEDS = [
 ]
 
 
-# A small, separate Python process does each batch of news / earnings lookups.
-# It has a hard time limit and is always finished or stopped before
-# market_tick returns, so a slow Yahoo reply can never hold up the engine.
-_LOOKUP_CHILD = r"""
-import json, sys
-import yfinance as yf
-for sym in sys.argv[1:]:
-    out = {"symbol": sym, "earn": [], "news": [], "ok": True}
-    try:
-        t = yf.Ticker(sym)
-        try:
-            cal = t.calendar
-            dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
-            out["earn"] = [str(d)[:10] for d in (dates or [])]
-        except Exception as e:
-            out["ok"] = False
-            out["error"] = "calendar: " + str(e)[:100]
-        try:
-            items = t.get_news(count=20) if hasattr(t, "get_news") else t.news
-            for a in items or []:
-                c = a.get("content") if isinstance(a.get("content"), dict) else a
-                when = c.get("pubDate") or c.get("displayTime") or a.get("providerPublishTime")
-                out["news"].append([str(when), str(c.get("title") or "")[:200]])
-        except Exception as e:
-            out["error"] = (out.get("error", "") + " news: " + str(e)[:100]).strip()
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)[:120]
-    print(json.dumps(out), flush=True)
-"""
-
-RED_FLAGS = (
-    "investigat", "probe", "subpoena", "lawsuit", "sues ", "sued", "class action", "fraud",
-    "accounting", "restate", "sec charges", "recall", "downgrade", "cut to sell", "cuts guidance",
-    "lowers guidance", "lowered guidance", "slashes", "warns", "profit warning", "misses",
-    "plunge", "plummet", "tumble", "sinks", "halted", "bankrupt", "chapter 11", "delist",
-    "default", "resign", "ousted", "oust", "fired", "steps down", "short seller", "short report",
-    "secondary offering", "stock offering", "share offering", "dilution", "fda reject",
-    "complete response letter", "clinical hold", "trial fail", "failed trial", "data breach",
-    "cyberattack", "layoffs",
-)
-
-
 def _median(xs):
     xs = sorted(xs)
     n = len(xs)
@@ -143,13 +89,7 @@ def _clip(x, lo, hi):
 
 
 def _when(text):
-    """Seconds since 1970 from an ISO date string or a number, else None."""
-    if text in (None, "", "None"):
-        return None
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        pass
+    """Seconds since 1970 from an ISO date string, else None."""
     try:
         dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -192,7 +132,6 @@ class ClaudeBot:
         # ---- timing (minutes before the close / after the open)
         self.DECIDE_FROM = 35               # the daily decision: 35 to 12 minutes
         self.DECIDE_UNTIL = 12              # before the close
-        self.NEWS_CHECK_AFTER_OPEN = 30     # morning check of holdings' news
         self.STOP_GRACE = 5                 # ignore the first 5 minutes for stops
 
         # ---- protection
@@ -202,18 +141,6 @@ class ClaudeBot:
         self.COOLDOWN_DAYS = 3
         self.BRAKE_ON = 0.10
         self.BRAKE_OFF = 0.05
-        self.EARNINGS_BUY_DAYS = 5          # don't buy if results are due within 5 days
-        self.NEWS_HOURS = 48
-        self.NEWS_BURST = 12                # 12+ headlines in 48h = unusual attention
-
-        # ---- research (news and earnings dates from Yahoo)
-        self.RESEARCH = True
-        self.RESEARCH_SECONDS = 4.0         # hard limit per batch
-        self.RESEARCH_BATCH = 6
-        self.RESEARCH_EVERY_OPEN = 3        # while open: one batch every 3 cycles
-        self.NEWS_MAX_AGE_HELD = 2 * 3600
-        self.NEWS_MAX_AGE = 6 * 3600
-        self.EARN_MAX_AGE = 20 * 3600
 
         self._S = None
         self._dir = None
@@ -227,8 +154,6 @@ class ClaudeBot:
         self._ticks = 0
         self._last_save = 0.0
         self._last_scan_save = 0.0
-        self._research_fail = 0
-        self._research_pause_until = 0.0
 
     # =====================================================================
     # Engine entry point
@@ -259,9 +184,6 @@ class ClaudeBot:
             if ctx["from_open"] >= self.STOP_GRACE:
                 orders += guarded("stops", self._stops, data, ctx) or []
             busy = {o["symbol"] for o in orders}
-            if ctx["from_open"] >= self.NEWS_CHECK_AFTER_OPEN:
-                orders += guarded("news check", self._news_check, data, ctx, busy) or []
-            busy = {o["symbol"] for o in orders}
             deciding = (self._S["last_decision"] != ctx["day"]
                         and self.DECIDE_UNTIL <= ctx["to_close"] <= self.DECIDE_FROM)
             if deciding:
@@ -269,8 +191,6 @@ class ClaudeBot:
             busy = {o["symbol"] for o in orders}
             orders += guarded("orders", self._work_pending, data, ctx, busy,
                               max(0, 20 - len(orders))) or []
-        if not deciding:
-            guarded("research", self._research, data, ctx)
         guarded("watchlist", self._plan_watchlist, data, ctx)
         guarded("status", self._set_status, data, ctx)
         if problems:
@@ -421,7 +341,7 @@ class ClaudeBot:
     # Ranking and market mood
     # =====================================================================
     def _rank(self, day):
-        key = (day, self._version, len(self._S["info"]))
+        key = (day, self._version)
         if self._rank_cache[0] == key:
             return self._rank_cache[1]
         R = {"n": 0, "longs": [], "shorts": [], "breadth": 0.0, "med20": 0.0, "latest": ""}
@@ -486,115 +406,6 @@ class ClaudeBot:
         return sum((x[i] - mx) * (y[i] - my) for i in range(n)) / math.sqrt(sxx * syy)
 
     # =====================================================================
-    # Research: earnings dates and headlines
-    # =====================================================================
-    def _info(self, sym):
-        return self._S["info"].get(sym)
-
-    def _earnings_within(self, sym, day, days):
-        info = self._info(sym)
-        if not info:
-            return False
-        for d in info.get("earn", []):
-            n = self._trading_days_until(day, d)
-            if 0 <= n <= days:
-                return True
-        return False
-
-    def _news_flags(self, sym, now, hours=None):
-        """(headlines in the window, red-flag headlines, a sample red flag)."""
-        info = self._info(sym)
-        if not info:
-            return 0, 0, ""
-        hours = hours or self.NEWS_HOURS
-        count = flags = 0
-        sample = ""
-        for when, title in info.get("news", []):
-            t = _when(when)
-            if t is None or now - t > hours * 3600:
-                continue
-            count += 1
-            low = " " + title.lower() + " "
-            if any(k in low for k in RED_FLAGS):
-                flags += 1
-                sample = sample or title
-        return count, flags, sample
-
-    def _research_targets(self, data, ctx):
-        S, now = self._S, ctx["now"]
-        held = list(data["account"]["positions"])
-        R = self._rank(ctx["day"])
-        candidates = [s for _, s in R["longs"][:30]]
-        if (S.get("mood") or "") == "BEAR" or R["breadth"] < 0.4:
-            candidates += [s for _, s in R["shorts"][:12]]
-        want = []
-        for sym in held + candidates:
-            info = S["info"].get(sym) or {}
-            age = now - info.get("t", 0)
-            limit = self.NEWS_MAX_AGE_HELD if sym in held else self.NEWS_MAX_AGE
-            if info.get("eday") != ctx["day"] and now - info.get("et", 0) > self.EARN_MAX_AGE:
-                limit = 0
-            if age > limit and sym not in want:
-                want.append(sym)
-        return want
-
-    def _research(self, data, ctx):
-        if not self.RESEARCH or time.time() < self._research_pause_until:
-            return
-        if ctx["open"] and self._ticks % self.RESEARCH_EVERY_OPEN:
-            return
-        want = self._research_targets(data, ctx)[:self.RESEARCH_BATCH]
-        if not want:
-            return
-        results = self._lookup(want)
-        now = ctx["now"]
-        got = 0
-        for r in results:
-            sym = r.get("symbol")
-            if sym not in want:
-                continue
-            got += 1 if r.get("ok") else 0
-            news = []
-            for when, title in r.get("news", [])[:20]:
-                t = _when(when)
-                if t is not None and now - t <= 72 * 3600:
-                    news.append([t, title])
-            info = self._S["info"].setdefault(sym, {})
-            info.update(t=now, news=news, ok=bool(r.get("ok")))
-            if r.get("ok"):
-                info.update(earn=r.get("earn", []), et=now, eday=ctx["day"])
-        if got == 0:
-            self._research_fail += 1
-            if self._research_fail >= 3:
-                self._research_pause_until = time.time() + 1800
-                self._research_fail = 0
-        else:
-            self._research_fail = 0
-        cutoff = now - 4 * 86400                        # forget stale entries
-        for sym in [s for s, i in self._S["info"].items() if i.get("t", 0) < cutoff]:
-            self._S["info"].pop(sym)
-
-    def _lookup(self, symbols):
-        """Runs the lookup child process; returns whatever finished in time."""
-        try:
-            done = subprocess.run([sys.executable, "-c", _LOOKUP_CHILD] + list(symbols),
-                                  capture_output=True, timeout=self.RESEARCH_SECONDS)
-            out = done.stdout
-        except subprocess.TimeoutExpired as e:
-            out = e.stdout or b""
-        except Exception:
-            return []
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        results = []
-        for line in (out or "").splitlines():
-            try:
-                results.append(json.loads(line))
-            except ValueError:
-                pass
-        return results
-
-    # =====================================================================
     # Protection
     # =====================================================================
     def _track_equity(self, data):
@@ -634,29 +445,11 @@ class ClaudeBot:
             S["pending"].pop(o["symbol"], None)
         return orders
 
-    def _news_check(self, data, ctx, busy):
-        """Once each morning: close a holding with a burst of bad headlines."""
-        S = self._S
-        if S["last_news_check"] == ctx["day"]:
-            return []
-        S["last_news_check"] = ctx["day"]
-        orders = []
-        for sym, pos in data["account"]["positions"].items():
-            if sym in busy:
-                continue
-            _, flags, sample = self._news_flags(sym, ctx["now"], hours=24)
-            if flags >= 2:
-                orders.append({"symbol": sym, "action": "SELL" if pos["side"] == "LONG" else "COVER",
-                               "amount": "ALL"})
-                S["cool"][sym] = ctx["day"]
-                S["log"].insert(0, f"{ctx['day']}: left {sym} on bad news ({sample[:60]})")
-        return orders
-
     # =====================================================================
     # The daily decision (35 to 12 minutes before the close)
     # =====================================================================
     def _decide(self, data, ctx, busy):
-        S, day, now = self._S, ctx["day"], ctx["now"]
+        S, day = self._S, ctx["day"]
         R = self._rank(day)
         if R["n"] < self.MIN_LIQUID:
             return []
@@ -687,12 +480,6 @@ class ClaudeBot:
             price = pos["price"]
             held_days = self._trading_days_until((S["trail"].get(sym) or {}).get("since", "2000-01-01"), day)
             young = 0 <= held_days < self.MIN_HOLD_DAYS
-            if self._earnings_within(sym, day, 1):
-                leave(sym, pos, "results due before the next session")
-                continue
-            if self._news_flags(sym, now)[1] >= 2:
-                leave(sym, pos, "bad news")
-                continue
             if pos["side"] == "LONG":
                 broken = bool(m) and "s50" in m and price < 0.98 * m["s50"]
                 ranked = long_rank.get(sym, 10 ** 6) < self.KEEP_RANK
@@ -720,11 +507,6 @@ class ClaudeBot:
                 if len(held) + len(chosen) >= n:
                     break
                 if sym in positions or sym in busy or self._cooling(sym, day):
-                    continue
-                if self._earnings_within(sym, day, self.EARNINGS_BUY_DAYS):
-                    continue
-                count, flags, _ = self._news_flags(sym, now)
-                if flags or count >= self.NEWS_BURST:
                     continue
                 m = self._scan[sym]
                 price = prices.get(sym)
@@ -821,7 +603,7 @@ class ClaudeBot:
             for _, sym in R["longs"][:60]:
                 if shown >= (16 if plan[2] == 0 else 12):
                     break
-                if not self._cooling(sym, day) and not self._earnings_within(sym, day, self.EARNINGS_BUY_DAYS):
+                if not self._cooling(sym, day):
                     want(sym)
                     shown += 1
             if plan[2]:
@@ -850,7 +632,6 @@ class ClaudeBot:
         positions = data["account"]["positions"]
         n_long = sum(1 for p in positions.values() if p["side"] == "LONG")
         n_short = len(positions) - n_long
-        researched = sum(1 for s in [x for _, x in R["longs"][:30]] if s in S["info"])
         if R["n"] < self.MIN_LIQUID:
             doing = f"scanning ({R['n']}/{self.MIN_LIQUID} liquid stocks ranked so far)"
         elif S["last_decision"] == ctx["day"]:
@@ -858,18 +639,15 @@ class ClaudeBot:
         elif ctx["open"]:
             doing = f"decides {self.DECIDE_FROM} min before the close (in {max(0, ctx['to_close'] - self.DECIDE_FROM):.0f} min)"
         else:
-            doing = "market closed - scanning and researching"
-        news = "" if self.RESEARCH else " | news off"
-        if time.time() < self._research_pause_until:
-            news = " | news lookups paused (Yahoo not answering)"
+            doing = "market closed - scanning"
         brake = " | drawdown brake ON" if S.get("brake") else ""
         self.status = (f"Mood {S.get('mood') or 'not judged yet'} (breadth {R['breadth']:.0%}) | "
-                       f"{n_long} long, {n_short} short | {R['n']} liquid stocks ranked, top 30 "
-                       f"researched: {researched} | {doing}{news}{brake}")[:300]
+                       f"{n_long} long, {n_short} short | {R['n']} liquid stocks ranked | "
+                       f"{doing}{brake}")[:300]
 
     def _fresh_state(self):
         return {"version": self.STATE_VERSION, "day": "", "pending": {}, "trail": {}, "cool": {},
-                "info": {}, "last_decision": "", "last_news_check": "", "peak": 100.0,
+                "last_decision": "", "peak": 100.0,
                 "brake": False, "mood": None, "breadth": 0.0, "med20": 0.0, "log": []}
 
     def _load(self, storage_dir):
