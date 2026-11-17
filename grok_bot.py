@@ -1,27 +1,25 @@
 class GrokBot:
     def __init__(self):
-        # 1. Broad Real-World Multi-Asset Server Watchlist Pool
         self.watchlist = [
-            "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD",
-            "NFLX", "PLTR", "SMCI", "ARM", "AVGO", "TSM", "COIN", "MSTR",
-            "SOFI", "HOOD", "RKLB", "IONQ", "ASTS", "OKLO", "PATH", "SNOW",
-            "CRWD", "PANW", "NET", "DDOG", "SHOP", "UBER"
+            "NVDA", "TSLA", "AMD", "META", "AMZN", "GOOGL", "MSFT", "AAPL",
+            "PLTR", "SMCI", "ARM", "AVGO", "COIN", "MSTR", "SNOW", "CRWD",
+            "NET", "DDOG", "PANW", "UBER", "SHOP", "HOOD", "SOFI", "IONQ",
+            "RKLB", "ASTS", "OKLO", "PATH", "U", "APP"
         ]
-        self.status = "GrokBot v3 ready"
+        self.status = "GrokBot v4 - selective"
         self.price_history = {}
         self.signal_state = {}
-        
-        # 2. Strategy Tunings & Volatility Configurations
-        self.max_history = 60
-        self.fast_period = 8
-        self.slow_period = 21
-        self.vol_lookback = 10
-        self.min_history = 25
-        self.max_positions = 6
-        self.risk_per_trade = 0.18
+        self.entry_time = {}
+        self.max_history = 80
+        self.fast_period = 10
+        self.slow_period = 24
+        self.vol_lookback = 12
+        self.min_history = 28
+        self.max_positions = 3
+        self.risk_frac = 0.22
+        self.min_hold_ticks = 8
 
     def _ema(self, data, period):
-        """Calculates internal Exponential Moving Average signals"""
         if len(data) < period:
             return None
         k = 2.0 / (period + 1.0)
@@ -31,27 +29,22 @@ class GrokBot:
         return ema
 
     def _avg_range(self, data):
-        """Measures historical price range vectors proxy to check volatility values"""
         if len(data) < self.vol_lookback + 1:
             return None
-        ranges = [abs(data[i] - data[i - 1]) for i in range(-self.vol_lookback, 0)]
+        ranges = [abs(data[i] - data[i-1]) for i in range(-self.vol_lookback, 0)]
         return sum(ranges) / float(len(ranges))
 
     def _get_closes(self, data, symbol):
-        """Builds a clean tracking series out of the server's candle queues"""
         bars = data.get("intraday_bars", {}).get(symbol)
-        if bars and len(bars) >= 5:
+        if bars and len(bars) >= 8:
             closes = [float(b[4]) for b in bars if b[4] is not None]
-            if len(closes) >= 5:
-                return closes
-                
+            if len(closes) >= 8:
+                return closes[-self.max_history:]
         price = data.get("prices", {}).get(symbol)
         if price is None:
             return []
-            
         if symbol not in self.price_history:
             self.price_history[symbol] = []
-            
         hist = self.price_history[symbol]
         hist.append(float(price))
         if len(hist) > self.max_history:
@@ -59,128 +52,116 @@ class GrokBot:
         return list(hist)
 
     def market_tick(self, data):
-        """Processes the full market data payload returned by engine.py every cycle"""
         orders = []
         if not isinstance(data, dict):
             return orders
-            
+
         market = data.get("market", {})
-        is_open = market.get("is_open", False)
+        is_open = bool(market.get("is_open", False))
         account = data.get("account", {})
         prices = data.get("prices", {})
         positions = account.get("positions", {})
-        
         equity = float(account.get("equity", 100.0) or 100.0)
-        cash = float(account.get("cash", 0.0) or 0.0)
         max_buy = float(account.get("max_new_buy", 0.0) or 0.0)
         max_short = float(account.get("max_new_short", 0.0) or 0.0)
+        tick = int(data.get("tick", 0))
+
         open_count = len(positions)
-        
-        self.status = f"eq=${equity:.2f} pos={open_count} cash=${cash:.2f}"
-        
-        # Dynamically add a few high-momentum names from movers if room
-        movers = data.get("movers", {})
-        gainers = movers.get("day_gainers", []) or []
-        actives = movers.get("most_actives", []) or []
-        candidates = []
-        
-        for lst in (gainers[:8], actives[:6]):
-            for item in lst:
-                sym = str(item.get("symbol", "")).upper().replace(".", "-")
-                if not sym or sym in self.watchlist:
-                    continue
-                if item.get("tradable") is False:
-                    continue
-                px = item.get("price") or 0
-                if px < 5.0:
-                    continue
-                candidates.append(sym)
-                
-        if candidates and len(self.watchlist) < 28:
-            for sym in candidates[:4]:
-                if sym not in self.watchlist:
-                    self.watchlist.append(sym)
-                    
-        # Trim watchlist if somehow over limit
-        if len(self.watchlist) > 30:
-            held = set(positions.keys())
-            self.watchlist = [s for s in self.watchlist if s in held] + [s for s in self.watchlist if s not in held]
-            self.watchlist = self.watchlist[:30]
-            
+        self.status = f"v4 eq=${equity:.2f} pos={open_count}"
+
         if not is_open:
             return orders
-            
-        for symbol in list(prices.keys()):
+
+        # --- Exit logic first ---
+        for symbol, pos in list(positions.items()):
             price = prices.get(symbol)
             if price is None or price <= 0:
                 continue
             price = float(price)
-            
+            side = pos.get("side")
+            units = float(pos.get("units", 0))
+            value = abs(float(pos.get("value", 0)))
+            unreal = float(pos.get("unrealized_pnl", 0))
+            held_ticks = tick - self.entry_time.get(symbol, tick)
+
             closes = self._get_closes(data, symbol)
             if len(closes) < self.min_history:
                 continue
-                
+
+            fast = self._ema(closes, self.fast_period)
+            slow = self._ema(closes, self.slow_period)
+            if fast is None or slow is None:
+                continue
+
+            # Profit take or momentum fade
+            take_profit = unreal > 0.018 * value
+            fade = abs(fast - slow) / price < 0.0009
+
+            if side == "LONG":
+                if (fast < slow * 0.9975) or (take_profit and fade) or (unreal < -0.028 * value):
+                    if held_ticks >= self.min_hold_ticks or unreal < -0.028 * value:
+                        orders.append({"symbol": symbol, "action": "SELL", "amount": "ALL"})
+                        self.signal_state[symbol] = "FLAT"
+                        self.entry_time.pop(symbol, None)
+
+            elif side == "SHORT":
+                if (fast > slow * 1.0025) or (take_profit and fade) or (unreal < -0.028 * value):
+                    if held_ticks >= self.min_hold_ticks or unreal < -0.028 * value:
+                        orders.append({"symbol": symbol, "action": "COVER", "amount": "ALL"})
+                        self.signal_state[symbol] = "FLAT"
+                        self.entry_time.pop(symbol, None)
+
+        if len(orders) >= 12:
+            return orders[:20]
+
+        # --- Entry logic ---
+        if open_count >= self.max_positions:
+            return orders[:20]
+
+        candidates = []
+        for symbol in list(prices.keys()):
+            if symbol in positions:
+                continue
+            price = float(prices[symbol])
+            if price < 5.0:
+                continue
+
+            closes = self._get_closes(data, symbol)
+            if len(closes) < self.min_history:
+                continue
+
             fast = self._ema(closes, self.fast_period)
             slow = self._ema(closes, self.slow_period)
             vol = self._avg_range(closes)
-            
             if fast is None or slow is None or vol is None or vol <= 0:
                 continue
-                
-            recent_move = abs(closes[-1] - closes[-4]) if len(closes) >= 4 else vol
-            if recent_move < vol * 0.40:
+
+            # Require clear trend + decent activity
+            sep = abs(fast - slow) / price
+            recent = abs(closes[-1] - closes[-5]) if len(closes) >= 5 else 0
+            if sep < 0.0022 or recent < vol * 0.55:
                 continue
-                
-            bullish = fast > slow * 1.0018
-            bearish = fast < slow * 0.9982
-            prev = self.signal_state.get(symbol, "FLAT")
-            
-            pos = positions.get(symbol)
-            side = pos["side"] if pos else None
-            units = float(pos["units"]) if pos else 0.0
-            unrealized = float(pos.get("unrealized_pnl", 0.0)) if pos else 0.0
-            value = abs(float(pos.get("value", 0.0))) if pos else 0.0
-            
-            # Exit logic first
-            if side == "LONG":
-                if bearish or (unrealized > 0 and abs(fast - slow) / price < 0.0010):
-                    orders.append({"symbol": symbol, "action": "SELL", "amount": "ALL"})
-                    self.signal_state[symbol] = "FLAT"
-                    continue
-                if unrealized < -0.035 * value and value > 2.0:
-                    orders.append({"symbol": symbol, "action": "SELL", "amount": "ALL"})
-                    self.signal_state[symbol] = "FLAT"
-                    continue
-                    
-            if side == "SHORT":
-                if bullish or (unrealized > 0 and abs(fast - slow) / price < 0.0010):
-                    orders.append({"symbol": symbol, "action": "COVER", "amount": "ALL"})
-                    self.signal_state[symbol] = "FLAT"
-                    continue
-                if unrealized < -0.035 * value and value > 2.0:
-                    orders.append({"symbol": symbol, "action": "COVER", "amount": "ALL"})
-                    self.signal_state[symbol] = "FLAT"
-                    continue
-                    
-            # Entry logic
-            if side is None and open_count < self.max_positions:
-                target = min(equity * self.risk_per_trade, max_buy if bullish else max_short)
-                if target < 3.0:
-                    continue
-                if bullish and max_buy >= 3.0 and price >= 1.0:
-                    amt = min(target, max_buy * 0.95)
-                    if amt >= 3.0:
-                        orders.append({"symbol": symbol, "action": "BUY", "amount": round(amt, 2)})
-                        self.signal_state[symbol] = "LONG"
-                        open_count += 1
-                elif bearish and max_short >= 3.0 and price >= 5.0:
-                    amt = min(target, max_short * 0.95)
-                    if amt >= 3.0:
-                        orders.append({"symbol": symbol, "action": "SHORT", "amount": round(amt, 2)})
-                        self.signal_state[symbol] = "SHORT"
-                        open_count += 1
-                        
-            if len(orders) >= 18:
+
+            strength = sep * 1000 + (recent / vol)
+            if fast > slow * 1.0028:
+                candidates.append((strength, symbol, "BUY", price))
+            elif fast < slow * 0.9972:
+                candidates.append((strength, symbol, "SHORT", price))
+
+        # Take only the strongest signals
+        candidates.sort(reverse=True)
+        for strength, symbol, action, price in candidates[:4]:
+            if open_count >= self.max_positions:
                 break
-                
+            target = min(equity * self.risk_frac, max_buy if action == "BUY" else max_short)
+            if target < 6.0:
+                continue
+            amt = round(min(target * 0.92, (max_buy if action == "BUY" else max_short) * 0.90), 2)
+            if amt < 6.0:
+                continue
+            orders.append({"symbol": symbol, "action": action, "amount": amt})
+            self.signal_state[symbol] = action
+            self.entry_time[symbol] = tick
+            open_count += 1
+
         return orders[:20]
