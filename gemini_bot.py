@@ -1,3 +1,4 @@
+from operator import itemgetter
 import numpy as np
 
 
@@ -16,14 +17,16 @@ class GeminiBot:
         # Internal state tracking (persists across ticks in memory)
         self.tick_count = 0
         self.entry_tick = {}       # ticker -> tick entered
+        self.entry_price = {}      # ticker -> price at entry
         self.peak_price = {}       # ticker -> best price since entry
         self.cooldown_until = {}   # ticker -> earliest tick allowed to re-enter
         self.status = "🤖 Gemini v2.0: Trend-Confirmed Breakout & Trailing Lock Active."
 
     def _compute_ema(self, values, span):
         alpha = 2.0 / (span + 1.0)
-        ema = values[0]
-        for val in values[1:]:
+        it = iter(values)
+        ema = next(it)
+        for val in it:
             ema = alpha * val + (1.0 - alpha) * ema
         return ema
 
@@ -68,6 +71,7 @@ class GeminiBot:
         for tracked in list(self.entry_tick.keys()):
             if tracked not in current_positions:
                 self.entry_tick.pop(tracked, None)
+                self.entry_price.pop(tracked, None)
                 self.peak_price.pop(tracked, None)
 
         if not data.get("market", {}).get("is_open"):
@@ -82,7 +86,7 @@ class GeminiBot:
         target_alloc = round(equity * 0.192, 2)
         min_entry_alloc = round(equity * 0.12, 2)
         active_slot_count = len(current_positions)
-        # D. STEP 1: MANAGE EXITS & CONSOLIDATE DUST POSITIONS FIRST
+        # D. STEP 1: MANAGE EXITS
         for ticker in held_tickers:
             if len(orders) >= 20:
                 break
@@ -93,14 +97,11 @@ class GeminiBot:
             side = pos.get("side")
             current_price = float(current_prices[ticker])
 
-            # Estimate current market value of position
-            pos_value = float(pos.get("market_value", pos.get("value", 0.0)))
-            if pos_value <= 0.0 and "qty" in pos:
-                pos_value = abs(float(pos["qty"])) * current_price
-
-            # Initialize tracking if bot restarted mid-session
+            # Initialize tracking if not yet recorded
             if ticker not in self.entry_tick:
                 self.entry_tick[ticker] = self.tick_count
+            if ticker not in self.entry_price:
+                self.entry_price[ticker] = float(pos.get("avg_price", pos.get("entry_price", current_price)))
             if ticker not in self.peak_price:
                 self.peak_price[ticker] = current_price
 
@@ -112,44 +113,46 @@ class GeminiBot:
 
             ticks_held = self.tick_count - self.entry_tick[ticker]
             history = self.price_history.get(ticker, [])
+            entry_px = self.entry_price[ticker]
+
+            # BUG FIX: Never exit within the first 10 ticks of holding
+            if ticks_held < 10 or len(history) < self.window_size:
+                continue
+
+            window = history[-self.window_size:]
+            mean = float(np.mean(window))
+            std = float(np.std(window))
+            upper_band = mean + (self.num_std * std)
+            lower_band = mean - (self.num_std * std)
 
             should_exit = False
 
-            # 1. Consolidate legacy dust positions (< $8) immediately to free up full slots
-            if 0.0 < pos_value < 8.0:
-                should_exit = True
+            if side == "LONG":
+                peak = self.peak_price[ticker]
+                trailing_floor = peak - max(1.5 * std, peak * 0.008)
+                hard_stop_hit = current_price < lower_band
+                midband_fail = current_price < mean
+                # BUG FIX: Trailing stop only arms after price rises >= 1.5% above entry_px
+                trailing_hit = (peak >= entry_px * 1.015) and (current_price < trailing_floor)
+                if hard_stop_hit or midband_fail or trailing_hit:
+                    should_exit = True
 
-            # 2. Evaluate technical & trailing exits once enough history exists
-            elif len(history) >= self.window_size:
-                window = history[-self.window_size:]
-                mean = float(np.mean(window))
-                std = float(np.std(window))
-                upper_band = mean + (self.num_std * std)
-                lower_band = mean - (self.num_std * std)
-
-                if side == "LONG":
-                    peak = self.peak_price[ticker]
-                    trailing_floor = peak - max(1.5 * std, peak * 0.008)
-                    hard_stop_hit = current_price < lower_band
-                    midband_fail = ticks_held >= 10 and current_price < mean
-                    trailing_hit = (peak > mean * 1.005) and (current_price < trailing_floor) and ticks_held >= 5
-                    if hard_stop_hit or midband_fail or trailing_hit:
-                        should_exit = True
-
-                elif side == "SHORT":
-                    trough = self.peak_price[ticker]
-                    trailing_ceiling = trough + max(1.5 * std, trough * 0.008)
-                    hard_stop_hit = current_price > upper_band
-                    midband_fail = ticks_held >= 10 and current_price > mean
-                    trailing_hit = (trough < mean * 0.995) and (current_price > trailing_ceiling) and ticks_held >= 5
-                    if hard_stop_hit or midband_fail or trailing_hit:
-                        should_exit = True
+            elif side == "SHORT":
+                trough = self.peak_price[ticker]
+                trailing_ceiling = trough + max(1.5 * std, trough * 0.008)
+                hard_stop_hit = current_price > upper_band
+                midband_fail = current_price > mean
+                # BUG FIX: Trailing stop only arms after price drops >= 1.5% below entry_px
+                trailing_hit = (trough <= entry_px * 0.985) and (current_price > trailing_ceiling)
+                if hard_stop_hit or midband_fail or trailing_hit:
+                    should_exit = True
 
             if should_exit:
                 action = "SELL" if side == "LONG" else "COVER"
                 orders.append({"symbol": ticker, "action": action, "amount": "ALL"})
                 self.cooldown_until[ticker] = self.tick_count + 25
                 self.entry_tick.pop(ticker, None)
+                self.entry_price.pop(ticker, None)
                 self.peak_price.pop(ticker, None)
                 active_slot_count = max(0, active_slot_count - 1)
 
@@ -199,7 +202,7 @@ class GeminiBot:
                 candidates.append((abs(z_score), "SHORT", ticker, current_price))
 
         # Prioritize strongest statistical breakouts first
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates.sort(key=itemgetter(0), reverse=True)
 
         for _, action, ticker, _ in candidates:
             if len(orders) >= 20 or active_slot_count >= self.max_positions:
@@ -215,6 +218,7 @@ class GeminiBot:
                     max_short -= trade_amt
                     active_slot_count += 1
                     self.entry_tick[ticker] = self.tick_count
+                    self.entry_price[ticker] = float(current_prices[ticker])
                     self.peak_price[ticker] = float(current_prices[ticker])
 
             elif action == "SHORT":
@@ -227,6 +231,7 @@ class GeminiBot:
                     max_buy -= trade_amt
                     active_slot_count += 1
                     self.entry_tick[ticker] = self.tick_count
+                    self.entry_price[ticker] = float(current_prices[ticker])
                     self.peak_price[ticker] = float(current_prices[ticker])
 
         return orders
