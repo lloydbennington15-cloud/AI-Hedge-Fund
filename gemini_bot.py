@@ -1,5 +1,19 @@
+from datetime import datetime, timezone
 from operator import itemgetter
+import time
+
 import numpy as np
+
+
+def _to_epoch(text):
+    """ISO 8601 time string -> seconds since 1970 (None if it can't be read)."""
+    try:
+        when = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return when.timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 class GeminiBot:
@@ -14,12 +28,17 @@ class GeminiBot:
         self.num_std = 2.1
         self.max_positions = 5
 
+        # Time rules, in MINUTES of real time (fix: these used to be counted in
+        # engine cycles, which are 20 seconds long, so they ran 3x too fast)
+        self.min_hold_minutes = 10
+        self.cooldown_minutes = 25
+
         # Internal state tracking (persists across ticks in memory)
         self.tick_count = 0
-        self.entry_tick = {}       # ticker -> tick entered
+        self.entry_time = {}       # ticker -> time entered (seconds since 1970)
         self.entry_price = {}      # ticker -> price at entry
         self.peak_price = {}       # ticker -> best price since entry
-        self.cooldown_until = {}   # ticker -> earliest tick allowed to re-enter
+        self.cooldown_until = {}   # ticker -> earliest time allowed to re-enter (seconds since 1970)
         self.status = "🤖 Gemini v2.0: Trend-Confirmed Breakout & Trailing Lock Active."
 
     def _compute_ema(self, values, span):
@@ -34,6 +53,9 @@ class GeminiBot:
         """Processes market ticks with strict 5-slot sizing, anti-churn cooldowns, and trailing stops."""
         orders = []
         self.tick_count += 1
+        now = _to_epoch(data.get("timestamp_utc"))
+        if now is None:
+            now = time.time()
 
         account = data.get("account", {})
         current_positions = account.get("positions", {})
@@ -58,24 +80,40 @@ class GeminiBot:
         if combined_watchlist:
             self.watchlist = combined_watchlist
 
-        # B. PRICE SYNCHRONIZATION: Maintain rolling 60-tick price history
         current_prices = data.get("prices", {})
-        for ticker, price in current_prices.items():
-            if ticker not in self.price_history:
-                self.price_history[ticker] = []
-            self.price_history[ticker].append(float(price))
-            if len(self.price_history[ticker]) > 60:
-                self.price_history[ticker].pop(0)
 
         # Clean up tracking dicts for positions no longer held
-        for tracked in list(self.entry_tick.keys()):
+        for tracked in list(self.entry_time.keys()):
             if tracked not in current_positions:
-                self.entry_tick.pop(tracked, None)
+                self.entry_time.pop(tracked, None)
                 self.entry_price.pop(tracked, None)
                 self.peak_price.pop(tracked, None)
 
-        if not data.get("market", {}).get("is_open"):
+        market = data.get("market", {})
+        if not market.get("is_open"):
             return []
+
+        # B. PRICE SYNCHRONIZATION: rolling history of the last 60 one-minute closes.
+        # FIX: built from today's 1-minute candles, so each entry really is one
+        # minute apart (window_size = 20 -> 20 minutes). It used to append the
+        # price every 20-second cycle (and every 60 seconds overnight), so the
+        # "20-minute" window only covered ~6.7 minutes. The newest candle's close
+        # is the current price, exactly as before.
+        session_open = _to_epoch(market.get("opens_at_utc"))
+        bars_by_ticker = data.get("intraday_bars", {})
+        self.price_history = {}
+        for ticker in current_prices:
+            closes = []
+            for bar in reversed(bars_by_ticker.get(ticker, ())):
+                if len(closes) >= 60:
+                    break
+                bar_time = _to_epoch(bar[0])
+                if session_open is not None and bar_time is not None and bar_time < session_open:
+                    break                       # only today's regular session
+                if bar[4] is not None:
+                    closes.append(float(bar[4]))
+            closes.reverse()
+            self.price_history[ticker] = closes
 
         # C. PORTFOLIO & RISK PARAMETERS
         equity = float(account.get("equity", 100.0))
@@ -98,8 +136,8 @@ class GeminiBot:
             current_price = float(current_prices[ticker])
 
             # Initialize tracking if not yet recorded
-            if ticker not in self.entry_tick:
-                self.entry_tick[ticker] = self.tick_count
+            if ticker not in self.entry_time:
+                self.entry_time[ticker] = now
             if ticker not in self.entry_price:
                 self.entry_price[ticker] = float(pos.get("avg_price", pos.get("entry_price", current_price)))
             if ticker not in self.peak_price:
@@ -111,12 +149,12 @@ class GeminiBot:
             elif side == "SHORT":
                 self.peak_price[ticker] = min(self.peak_price[ticker], current_price)
 
-            ticks_held = self.tick_count - self.entry_tick[ticker]
+            minutes_held = (now - self.entry_time[ticker]) / 60.0
             history = self.price_history.get(ticker, [])
             entry_px = self.entry_price[ticker]
 
-            # BUG FIX: Never exit within the first 10 ticks of holding
-            if ticks_held < 10 or len(history) < self.window_size:
+            # Never exit within the first 10 minutes of holding (FIX: real minutes, not 20-second cycles)
+            if minutes_held < self.min_hold_minutes or len(history) < self.window_size:
                 continue
 
             window = history[-self.window_size:]
@@ -150,8 +188,8 @@ class GeminiBot:
             if should_exit:
                 action = "SELL" if side == "LONG" else "COVER"
                 orders.append({"symbol": ticker, "action": action, "amount": "ALL"})
-                self.cooldown_until[ticker] = self.tick_count + 25
-                self.entry_tick.pop(ticker, None)
+                self.cooldown_until[ticker] = now + self.cooldown_minutes * 60  # FIX: 25 real minutes
+                self.entry_time.pop(ticker, None)
                 self.entry_price.pop(ticker, None)
                 self.peak_price.pop(ticker, None)
                 active_slot_count = max(0, active_slot_count - 1)
@@ -164,7 +202,7 @@ class GeminiBot:
         for ticker in self.watchlist:
             if ticker in current_positions:
                 continue
-            if self.tick_count < self.cooldown_until.get(ticker, 0):
+            if now < self.cooldown_until.get(ticker, 0):
                 continue
             if ticker not in current_prices:
                 continue
@@ -217,7 +255,7 @@ class GeminiBot:
                     max_buy -= trade_amt * 1.002
                     max_short -= trade_amt
                     active_slot_count += 1
-                    self.entry_tick[ticker] = self.tick_count
+                    self.entry_time[ticker] = now
                     self.entry_price[ticker] = float(current_prices[ticker])
                     self.peak_price[ticker] = float(current_prices[ticker])
 
@@ -230,7 +268,7 @@ class GeminiBot:
                     max_short -= trade_amt * 1.002
                     max_buy -= trade_amt
                     active_slot_count += 1
-                    self.entry_tick[ticker] = self.tick_count
+                    self.entry_time[ticker] = now
                     self.entry_price[ticker] = float(current_prices[ticker])
                     self.peak_price[ticker] = float(current_prices[ticker])
 
